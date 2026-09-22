@@ -7,7 +7,7 @@ Farben zu sortieren und in Zonen zu stapeln — **ohne Internet, ohne Cloud, mit
 100-Hz-Taktung und kontinuierlicher Online-Adaption**.
 
 **Repo:** https://github.com/KilllerBoss/panda-cube-sorter
-**APK-Download:** [Release v1.1.0](https://github.com/KilllerBoss/panda-cube-sorter/releases/download/v1.1.0/PandaCubeSorter-v1.1.0-release.apk)
+**APK-Download:** [Release v1.2.0](https://github.com/KilllerBoss/panda-cube-sorter/releases/download/v1.2.0/PandaCubeSorter-v1.2.0-release.apk)
 
 ---
 
@@ -16,7 +16,7 @@ Farben zu sortieren und in Zonen zu stapeln — **ohne Internet, ohne Cloud, mit
 | Baustein | Status | Ort |
 |---|---|---|
 | MuJoCo 3.13.0, arm64-v8a, `-O3 -fPIC -ffp-contract=fast` | gebaut & in APK gepackt | `app/libs/arm64-v8a/libmujoco.so` |
-| Physikszene (Panda 7-DOF, Parallelgreifer, Tisch, 4 Zonen, 8 Würfel) als binäres `.mjb` | kompiliert | `scene/`, `app/src/main/assets/` |
+| Physikszene mit dem **echten MuJoCo-Menagerie-Panda** (67 Meshes, ~137k Faces), Parallelgreifer, Tisch, 4 Zonen, Würfel als binäres `.mjb` | kompiliert | `scene/`, `app/src/main/assets/` |
 | Event-Kamera (simuliert, 96×72, bipolare Events + Hue-Kanäle) | implementiert | `native/src/event_camera.cpp` |
 | ALIF-LSNN (128 Neuronen, adaptiver Schwellwert `v_th(t)`) | implementiert | `native/src/alif_lsnn.cpp` |
 | Predictive Coding (FEP) → 32-dim Embedding | implementiert | `native/src/pred_coder.cpp` |
@@ -27,7 +27,7 @@ Farben zu sortieren und in Zonen zu stapeln — **ohne Internet, ohne Cloud, mit
 | NativeActivity + OpenGL-ES-3.0-Rendering + HUD | implementiert | `app/src/main/cpp/` |
 | Trainings-Pipeline (Collect → NMF → KAN → Heads → Export) | implementiert, lauffähig | `toolchain/` |
 | Desktop-Harness (Benchmarks + Erfolgsquote, ohne Android) | implementiert | `desktop/`, `scripts/run_harness.sh` |
-| Signierte Release-APK (minSdk 31, arm64-v8a, offline) | **erzeugt & publiziert** | `apk/PandaCubeSorter-v1.1.0-release.apk` |
+| Signierte Release-APK (minSdk 31, arm64-v8a, offline) | **erzeugt & publiziert** | `apk/PandaCubeSorter-v1.2.0-release.apk` |
 
 ## Änderungen in v1.0.1 — Black-Screen-Fix
 
@@ -86,6 +86,69 @@ Zusätzlich:
 
 Bei hartnäckigem E7: `adb logcat -d -s panda-sorter > pcs_log.txt` schicken — der Report
 enthält dann den exakten Treiber/Fehlerpunkt.
+
+## Änderungen in v1.2.0 — Echter Menagerie-Panda + Flacker-Fix
+
+**Das ist jetzt sichtbar** (Desktop-Render des exakten GLES-Codes, `docs/screenshot_v120.png`):
+
+![Was du siehst](docs/screenshot_v120.png)
+
+- Der **echte Franka-Panda** aus dem [MuJoCo-Menagerie](https://github.com/google-deepmind/mujoco_menagerie/tree/main/franka_emika_panda):
+  alle 67 Original-Meshes (~137.000 Faces, weiß/schwarz, blauer Hand-Akzent) statt
+  simpler Kapseln — hochauflösende 3D-Welt.
+- **Tisch + bunte Würfel + Boden** in ruhigen Farben, Zonen als halbtransparente
+  farbige Platten auf der Tischplatte.
+- **Roboter-Kamera oben rechts** („was der Roboter sieht“): die 96×72-Event-Kamera —
+  exakt die Auflösung, die die Perzeption braucht, nicht mehr.
+
+**Was der Roboter sieht** (`docs/camera_v120.png`): Top-Down-Sicht auf Tisch und Würfel,
+der Arm ragt von oben herein — die Zonenplatten werden im Kamerabild ausgeblendet
+(deren Farben würden die Würfel-Farbklassifikation stören).
+
+**Flicker behoben** („manchmal blinkt es, als würde alles verschieben und zurück“) —
+drei unabhängige Quellen:
+
+1. **Loop-Thread an Window-Surface:** die alte Fallback-Kette gab dem 100-Hz-Thread
+   notfalls eine **zweite Window-Surface auf demselben Fenster** (oder gar die geteilte).
+   Treiber reorganisieren beim `eglMakeCurrent` auf einer Window-Surface die
+   Buffer-Queue — die Ansicht präsentierte zwischendurch einen **veralteten Buffer**:
+   das Bild „springt und kommt zurück“. Die Kette ist jetzt **surfaceless → 1×1-Pbuffer
+   → gar kein GL** (Loop läuft weiter, Event-Pass pausiert). Niemals wieder ein
+   Window-Surface im Loop-Thread.
+2. **Kamera-Ruck im PiP:** alle 0,5 s versetzte der Refresh-Puls (0,8 cm Jitter für die
+   Event-Pipeline) auch das PiP-Bild sichtbar. Das PiP zeigt jetzt nur **unjitterte**
+   Frames.
+3. **VBO-Churn:** HUD/PiP erzeugten pro Frame 5 Puffer und löschten sie wieder —
+   jetzt feste Stream-VBOs mit Orphaning (Treiberdruck raus).
+
+**Weitere Verbesserungen:**
+
+- **Mesh-Renderer:** Geoms der Gruppe 2 (Visual-Meshes) werden aus `mjModel`-Meshdaten
+  in ein Interleaved-VBO gebaut (pos+normal, 9,8 MB) — Materialfarben aus `mat_rgba`,
+  Kollisions-Meshes (Gruppe 3) werden nie gezeichnet (z-fighting).
+- **Geom-lokale Transformationen:** Position/Quaternion pro Geom wird berücksichtigt
+  (der Menagerie-Panda versetzt seine Geoms innerhalb der Bodies).
+- **Zwei-Licht-Shading + Transparenz** (opaker Pass, dann Zonen mit Blending).
+- **Neue DLS-IK (`solve_ik_down`):** die alte geschlossene Fold-Formel galt nur für den
+  planaren Ersatzarm; der echte Panda (Schulter-Offset 0,0825 m, 45°-Handmontage)
+  braucht numerische IK — warmgestartet, Ansatzachse nach unten, 12 Iterationen,
+  läuft auf einem privaten `mjData`. Desktop-verifiziert: **alle Greif-/Transport-
+  Ziele ≤ 0,4 mm Fehler**, Ansatzachse exakt.
+- **Greifer an der echten Hand kalibriert:** Pad-Abstand = 11 mm + 2×Slide; Kontakt
+  über die Würfel-Diagonale bei Tendon-Summe ~0,068, flankenbündig ~0,040;
+  `kGripClosed=0.038` greift in beiden Fällen (2–15 N Klemmung). Desktop-Test:
+  Würfel wird gefasst **und gehoben**.
+- **`gles_init` wanderte auf den View-Thread:** die GL-Objekte existieren ab dem
+  ersten Frame — auch wenn der Loop-Thread keine EGL-Bindung bekommt (B2 im HUD).
+- **HUD zeigt `B0/B1/B2`** = Loop-Bindung (surfaceless / pbuffer / keine).
+
+**Desktop-Verifikation (MuJoCo 3.13.0 = Geräte-Version):** 200 reale Pipeline-Zyklen:
+**1,05 ms/Zyklus** (Budget 10 ms), GL-Fehler 0, Bildinhalt 83,8 % Szene (v1.1.0: 0 %),
+Buttons-Hit-Test korrekt.
+
+**APK-Größe:** ~33 MB (davon 2×35 MB Szene-MJB komprimiert — volle Mesh-Qualität).
+Die MJBs sind mit MuJoCo **3.13.0** kompiliert — exakt die Version der mitgelieferten
+`libmujoco.so` (MJB-Format ist versions-strikt).
 
 ## Änderungen in v1.1.0 — Die Szene ist sichtbar + Bedien-UI (Buttons, Roboter-Kamera)
 

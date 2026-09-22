@@ -159,8 +159,11 @@ static const char* kFS =
 #endif
     "varying vec3 vNrm;\n"
     "varying vec4 vPos;\n"
-    "void main(){ float d = max(0.35, dot(normalize(vNrm), normalize(vec3(0.4,0.5,0.8))));\n"
-    "  gl_FragColor = vec4(uColor.rgb * d, uColor.a); }";
+    "void main(){ vec3 N = normalize(vNrm);\n"
+    "  float d = 0.35;\n"
+    "  d += 0.55 * max(0.0, dot(N, normalize(vec3(0.4,0.5,0.8))));\n"
+    "  d += 0.25 * max(0.0, dot(N, normalize(vec3(-0.6,0.3,-0.5))));\n"
+    "  gl_FragColor = vec4(uColor.rgb * min(d, 1.25), uColor.a); }";
 
 static const char* kHudVS =
     "attribute vec2 aPos;\n"
@@ -198,6 +201,22 @@ static int g_pip_w = 0, g_pip_h = 0;
 static bool g_pip_has = false;
 static std::mutex g_pip_mtx;
 static std::vector<uint8_t> g_pip_buf;  // latest perception frame (RGB)
+
+// persistent stream VBOs (one orphaning glBufferData per use instead of
+// create/destroy per frame — driver-side churn was a flicker contributor)
+static GLuint g_hud_vbo = 0, g_pip_vbo = 0, g_status_vbo = 0;
+
+// draw a batch of vec2 triangles from an orphaned stream buffer
+static void stream_draw_2f(GLuint vbo, GLint loc, const std::vector<float>& v) {
+  if (v.empty()) return;
+  glBindBuffer(GL_ARRAY_BUFFER, vbo);
+  glBufferData(GL_ARRAY_BUFFER, v.size() * sizeof(float), v.data(), GL_STREAM_DRAW);
+  glEnableVertexAttribArray((GLuint)loc);
+  glVertexAttribPointer((GLuint)loc, 2, GL_FLOAT, GL_FALSE, 8, (void*)0);
+  glDrawArrays(GL_TRIANGLES, 0, (GLint)(v.size() / 2));
+  glDisableVertexAttribArray((GLuint)loc);
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
 
 static GLuint make_program(const char* vs, const char* fs) {
   GLuint v = glCreateShader(GL_VERTEX_SHADER);
@@ -301,6 +320,90 @@ static void push_sphere(std::vector<float>& v) {
   }
 }
 
+// ---------------- real MuJoCo-Menagerie meshes (the Panda) ----------------
+// One interleaved VBO built once from mjModel mesh data (visual mesh geoms,
+// group 2); collision meshes (group 3) are skipped entirely.
+struct MeshRange {
+  int first;   // first vertex (6 floats each) inside g_mesh_vbo
+  int count;   // vertex count (3 per face)
+};
+static std::vector<MeshRange> g_mesh_rng;
+static GLuint g_mesh_vbo = 0;
+
+static void build_mesh_vbos(const mjModel* m) {
+  g_mesh_rng.assign(m->nmesh, MeshRange{0, 0});
+  std::vector<float> all;
+  all.reserve((size_t)m->nmeshface * 18);
+  for (int mi = 0; mi < m->nmesh; ++mi) {
+    const int vadr = m->mesh_vertadr[mi];
+    const int nadr = m->mesh_normaladr ? m->mesh_normaladr[mi] : vadr;
+    const int fadr = m->mesh_faceadr[mi];
+    const int nface = m->mesh_facenum[mi];
+    MeshRange rng;
+    rng.first = (int)all.size() / 6;
+    rng.count = nface * 3;
+    for (int f = 0; f < nface; ++f) {
+      const int* fv = m->mesh_face + 3 * (fadr + f);
+      const int* fn = m->mesh_facenormal ? m->mesh_facenormal + 3 * (fadr + f)
+                                         : nullptr;
+      float tri[3][6];
+      for (int k = 0; k < 3; ++k) {
+        const float* p = m->mesh_vert + 3 * (vadr + fv[k]);
+        tri[k][0] = p[0]; tri[k][1] = p[1]; tri[k][2] = p[2];
+        const float* n = nullptr;
+        if (fn && m->mesh_normalnum[mi] > 0)
+          n = m->mesh_normal + 3 * (nadr + fn[k]);
+        if (n) {
+          tri[k][3] = n[0]; tri[k][4] = n[1]; tri[k][5] = n[2];
+        } else {
+          // fallback: face normal from cross product
+          const int k1 = (k + 1) % 3, k2 = (k + 2) % 3;
+          const float* p1 = m->mesh_vert + 3 * (vadr + fv[k1]);
+          const float* p2 = m->mesh_vert + 3 * (vadr + fv[k2]);
+          const float e1[3] = {p1[0]-p[0], p1[1]-p[1], p1[2]-p[2]};
+          const float e2[3] = {p2[0]-p[0], p2[1]-p[1], p2[2]-p[2]};
+          float nrm[3] = {e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2],
+                          e1[0]*e2[1]-e1[1]*e2[0]};
+          const float len = sqrtf(nrm[0]*nrm[0]+nrm[1]*nrm[1]+nrm[2]*nrm[2])
+                            + 1e-12f;
+          tri[k][3] = nrm[0]/len; tri[k][4] = nrm[1]/len; tri[k][5] = nrm[2]/len;
+        }
+      }
+      for (auto& corner : tri) all.insert(all.end(), corner, corner + 6);
+    }
+    g_mesh_rng[mi] = rng;
+  }
+  if (!all.empty()) {
+    glGenBuffers(1, &g_mesh_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, g_mesh_vbo);
+    glBufferData(GL_ARRAY_BUFFER, all.size() * sizeof(float), all.data(),
+                 GL_STATIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+  }
+  LOGW("mesh VBOs: nmesh=%ld faces=%ld bytes=%ld", (long)m->nmesh,
+       (long)m->nmeshface, (long)all.size() * (long)sizeof(float));
+}
+
+// geom-local transform (pos + quat) as a 4x4 column-major matrix
+static void geom_local_transform(const mjModel* m, int g, Mat4& L) {
+  const mjtNum* gp = m->geom_pos + 3 * g;
+  float gq[4] = {1.f, 0.f, 0.f, 0.f};
+  if (m->geom_quat) {
+    gq[0] = (float)m->geom_quat[4 * g + 0];
+    gq[1] = (float)m->geom_quat[4 * g + 1];
+    gq[2] = (float)m->geom_quat[4 * g + 2];
+    gq[3] = (float)m->geom_quat[4 * g + 3];
+  }
+  float R[9];
+  quat_to_mat(gq, R);
+  for (int c = 0; c < 3; ++c) {
+    for (int r = 0; r < 3; ++r) L.m[4 * c + r] = R[3 * r + c];
+    L.m[12 + c] = (float)gp[c];
+  }
+  L.m[3] = L.m[7] = L.m[11] = 0.f;
+  L.m[15] = 1.f;
+}
+
 void gles_init(SimGlue& glue, int win_w, int win_h) {
   g_win_w = win_w; g_win_h = win_h;
   g_prog = make_program(kVS, kFS);
@@ -333,6 +436,9 @@ void gles_init(SimGlue& glue, int win_w, int win_h) {
   glBindBuffer(GL_ARRAY_BUFFER, 0);
   glDisable(GL_DEPTH_TEST);
 
+  // real Panda: interleaved mesh VBO from the compiled model
+  build_mesh_vbos(glue.model());
+
   // PiP textured-quad program (shares the HUD vertex layout style)
   static const char* kPipVS =
       "attribute vec2 aPos;\n"
@@ -362,59 +468,87 @@ void gles_init(SimGlue& glue, int win_w, int win_h) {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glBindTexture(GL_TEXTURE_2D, 0);
 
+  glGenBuffers(1, &g_hud_vbo);
+  glGenBuffers(1, &g_pip_vbo);
+
   LOGW("gles_init done %dx%d", win_w, win_h);
 }
 
-// draw one geom (box or capsule) with color; poses come from the snapshot
+// draw one geom (primitive or mesh) with color; poses come from the snapshot.
+// Includes the geom-local pos/quat transform (the Menagerie Panda geoms are
+// offset inside their bodies — v1.1.0 ignored this, primitives happened to
+// sit at their body origins).
 static void draw_geom(const mjModel* m, const std::vector<float>& pos,
                       const std::vector<float>& quat, int g, float alpha) {
   const int body = m->geom_bodyid[g];
   float M[16];
   body_transform(body, pos, quat, M);
+  Mat4 Mb, L;
+  std::memcpy(Mb.m, M, sizeof(Mb.m));
+  geom_local_transform(m, g, L);
   const mjtNum* size = m->geom_size + 3 * g;
   const int type = m->geom_type[g];
-  const float* rgba = m->geom_rgba + 4 * g;
-  float col[4] = {(float)rgba[0], (float)rgba[1], (float)rgba[2],
-                  alpha < 0.f ? (float)rgba[3] : alpha};
+  // color: material first (Menagerie uses materials), else geom_rgba
+  float col[4] = {1.f, 1.f, 1.f, 1.f};
+  const int matid = m->geom_matid[g];
+  if (matid >= 0) {
+    const float* mr = m->mat_rgba + 4 * matid;
+    col[0] = mr[0]; col[1] = mr[1]; col[2] = mr[2]; col[3] = mr[3];
+  } else {
+    const float* rgba = m->geom_rgba + 4 * g;
+    col[0] = rgba[0]; col[1] = rgba[1]; col[2] = rgba[2]; col[3] = rgba[3];
+  }
+  if (alpha >= 0.f) col[3] = alpha;
 
-  Mat4 Mb, scale = Mat4::identity();
-  std::memcpy(Mb.m, M, sizeof(Mb.m));
-  if (type == mjGEOM_CAPSULE || type == mjGEOM_CYLINDER) {
+  GLuint vbo = 0;
+  int count = 0;
+  GLint voff = 0;
+  Mat4 model = Mb * L;
+  if (type == mjGEOM_MESH) {
+    const int dataid = m->geom_dataid[g];
+    if (dataid < 0 || g_mesh_vbo == 0 || dataid >= (int)g_mesh_rng.size()) return;
+    const MeshRange& rng = g_mesh_rng[dataid];
+    if (rng.count <= 0) return;
+    vbo = g_mesh_vbo;
+    count = rng.count;
+    voff = rng.first;
+  } else if (type == mjGEOM_CAPSULE || type == mjGEOM_CYLINDER) {
     // MuJoCo capsule: along local z, half-length size[1]; our VBO: along x
+    Mat4 scale = Mat4::identity();
     scale.m[0] = (float)size[0]; scale.m[5] = (float)size[0]; scale.m[10] = (float)size[1];
     Mat4 rot = Mat4::identity();   // align z-axis with x-axis
     rot.m[0] = 0; rot.m[2] = -1; rot.m[8] = 1; rot.m[10] = 0;
-    Mat4 model = Mb * rot * scale;
-    glUniformMatrix4fv(g_uModel, 1, GL_FALSE, model.m);
+    model = model * rot * scale;
+    vbo = g_cyl_vbo; count = g_cyl_count;
   } else if (type == mjGEOM_BOX) {
+    Mat4 scale = Mat4::identity();
     scale.m[0] = (float)size[0]; scale.m[5] = (float)size[1]; scale.m[10] = (float)size[2];
-    Mat4 model = Mb * scale;
-    glUniformMatrix4fv(g_uModel, 1, GL_FALSE, model.m);
+    model = model * scale;
+    vbo = g_cube_vbo; count = 36;
   } else if (type == mjGEOM_SPHERE) {
+    Mat4 scale = Mat4::identity();
     scale.m[0] = scale.m[5] = scale.m[10] = (float)size[0];
-    Mat4 model = Mb * scale;
-    glUniformMatrix4fv(g_uModel, 1, GL_FALSE, model.m);
+    model = model * scale;
+    vbo = g_sph_vbo; count = g_sph_count;
   } else if (type == mjGEOM_PLANE) {
-    scale.m[0] = (float)size[0]; scale.m[5] = (float)size[1];
+    Mat4 scale = Mat4::identity();
+    scale.m[0] = (float)size[0] > 0.01f ? (float)size[0] : 2.5f;
+    scale.m[5] = (float)size[1] > 0.01f ? (float)size[1] : 2.5f;
     scale.m[10] = 0.01f;  // thin slab — MuJoCo planes have no thickness
-    Mat4 model = Mb * scale;
-    glUniformMatrix4fv(g_uModel, 1, GL_FALSE, model.m);
+    model = model * scale;
+    vbo = g_cube_vbo; count = 36;
   } else {
     return;
   }
+  glUniformMatrix4fv(g_uModel, 1, GL_FALSE, model.m);
   glUniform4fv(g_uColor, 1, col);
-  GLuint vbo = g_cube_vbo;
-  int count = 36;
-  if (type == mjGEOM_CAPSULE || type == mjGEOM_CYLINDER) {
-    vbo = g_cyl_vbo; count = g_cyl_count;
-  } else if (type == mjGEOM_SPHERE) {
-    vbo = g_sph_vbo; count = g_sph_count;
-  }
   glBindBuffer(GL_ARRAY_BUFFER, vbo);
   glEnableVertexAttribArray((GLuint)g_aPos);
   glEnableVertexAttribArray((GLuint)g_aNrm);
-  glVertexAttribPointer((GLuint)g_aPos, 3, GL_FLOAT, GL_FALSE, 24, (void*)0);
-  glVertexAttribPointer((GLuint)g_aNrm, 3, GL_FLOAT, GL_FALSE, 24, (void*)12);
+  glVertexAttribPointer((GLuint)g_aPos, 3, GL_FLOAT, GL_FALSE, 24,
+                        (void*)(intptr_t)(voff * 24));
+  glVertexAttribPointer((GLuint)g_aNrm, 3, GL_FLOAT, GL_FALSE, 24,
+                        (void*)(intptr_t)(voff * 24 + 12));
   glDrawArrays(GL_TRIANGLES, 0, count);
   glDisableVertexAttribArray((GLuint)g_aPos);
   glDisableVertexAttribArray((GLuint)g_aNrm);
@@ -422,12 +556,15 @@ static void draw_geom(const mjModel* m, const std::vector<float>& pos,
 
 void gles_render_view(SimGlue& glue, Controller& ctrl) {
   const mjModel* m = glue.model();
+  // frame-stable snapshot of the window size (the activity thread may resize
+  // g_win_w/h at any moment — mixing sizes within one frame jitters the image)
+  const int W = g_win_w, H = g_win_h;
   std::vector<float> pos, quat;
   copy_poses(pos, quat);
   const bool have_poses = pos.size() >= (size_t)3 * m->nbody;
   // NEVER early-return: an invisible failure mode (grey screen) is worse
   // than a degraded frame. Without poses we still clear + show the HUD.
-  glViewport(0, 0, g_win_w, g_win_h);
+  glViewport(0, 0, W, H);
   glClearColor(0.09f, 0.10f, 0.12f, 1.f);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
   glEnable(GL_DEPTH_TEST);
@@ -438,17 +575,38 @@ void gles_render_view(SimGlue& glue, Controller& ctrl) {
           up[3] = {0, 0, 1};
     Mat4 view = Mat4::lookAt(eye, ctr, up);
     Mat4 proj = Mat4::perspective(50.f * (float)M_PI / 180.f,
-                                  (float)g_win_w / g_win_h, 0.05f, 10.f);
+                                  (float)W / H, 0.05f, 10.f);
     Mat4 vp = proj * view;
     glUniformMatrix4fv(g_uMVP, 1, GL_FALSE, vp.m);
 
-    // draw everything visible: floor, table, zones, arm, hand, cubes.
-    // v1.0.3 skipped contype==0 geoms — that hid the colored sorting zones.
+    // pass 1: opaque geoms (visual meshes group 2 + primitives),
+    // pass 2: translucent (zone plates) with blending, depth-write off.
+    // group 3 (collision meshes) is never drawn — it would z-fight the
+    // visual meshes of the Panda.
     for (int g = 0; g < m->ngeom; ++g) {
-      const float* rgba = m->geom_rgba + 4 * g;
-      if (rgba[3] < 0.05f) continue;  // fully transparent only
+      if (m->geom_group[g] == 3) continue;
+      float col_a = 1.f;
+      const int matid = m->geom_matid[g];
+      if (matid >= 0) col_a = (float)m->mat_rgba[4 * matid + 3];
+      else col_a = (float)m->geom_rgba[4 * g + 3];
+      if (col_a < 0.05f) continue;  // fully invisible
+      if (col_a < 0.95f) continue;  // translucent -> pass 2
       draw_geom(m, pos, quat, g, 1.f);
     }
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    for (int g = 0; g < m->ngeom; ++g) {
+      if (m->geom_group[g] == 3) continue;
+      float col_a = 1.f;
+      const int matid = m->geom_matid[g];
+      if (matid >= 0) col_a = (float)m->mat_rgba[4 * matid + 3];
+      else col_a = (float)m->geom_rgba[4 * g + 3];
+      if (col_a < 0.05f || col_a >= 0.95f) continue;
+      draw_geom(m, pos, quat, g, -1.f);
+    }
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
   }
   glDisable(GL_DEPTH_TEST);
   gles_draw_pip();
@@ -496,19 +654,7 @@ void gles_render_hud(const CycleStats& st, const TaskOutput& task) {
     v.insert(v.end(), {xa, ya, xb, yb, xa, yb});
   }
   glUniform4f(g_huColor, 0.13f, 0.14f, 0.16f, 0.92f);
-  if (!v.empty()) {
-    GLuint vbo;
-    glGenBuffers(1, &vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, v.size() * sizeof(float), v.data(),
-                 GL_STREAM_DRAW);
-    glEnableVertexAttribArray((GLuint)g_huPos);
-    glVertexAttribPointer((GLuint)g_huPos, 2, GL_FLOAT, GL_FALSE, 8, (void*)0);
-    glDrawArrays(GL_TRIANGLES, 0, (GLint)(v.size() / 2));
-    glDisableVertexAttribArray((GLuint)g_huPos);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glDeleteBuffers(1, &vbo);
-  }
+  stream_draw_2f(g_hud_vbo, g_huPos, v);
 
   // ---- batch 2: accent underline on the START button + bar color ----
   v.clear();
@@ -529,19 +675,7 @@ void gles_render_hud(const CycleStats& st, const TaskOutput& task) {
   glUniform4f(g_huColor, g_diag.paused ? 0.95f : 0.20f,
               g_diag.paused ? 0.75f : 0.85f, g_diag.paused ? 0.10f : 0.30f,
               1.f);
-  if (!v.empty()) {
-    GLuint vbo;
-    glGenBuffers(1, &vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, v.size() * sizeof(float), v.data(),
-                 GL_STREAM_DRAW);
-    glEnableVertexAttribArray((GLuint)g_huPos);
-    glVertexAttribPointer((GLuint)g_huPos, 2, GL_FLOAT, GL_FALSE, 8, (void*)0);
-    glDrawArrays(GL_TRIANGLES, 0, (GLint)(v.size() / 2));
-    glDisableVertexAttribArray((GLuint)g_huPos);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glDeleteBuffers(1, &vbo);
-  }
+  stream_draw_2f(g_hud_vbo, g_huPos, v);
 
   // ---- batch 3: white text (labels, diag, counters) ----
   const float s = std::max(3.f, H / 90.f);  // glyph pixel scale
@@ -570,19 +704,7 @@ void gles_render_hud(const CycleStats& st, const TaskOutput& task) {
   text_quads(v, l1, 0.02f * W, 0.03f * H + 6.f * s, s, W, H);
   text_quads(v, l2, 0.02f * W, 0.03f * H, s, W, H);
   glUniform4f(g_huColor, 1.f, 1.f, 1.f, 1.f);
-  if (!v.empty()) {
-    GLuint vbo;
-    glGenBuffers(1, &vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, v.size() * sizeof(float), v.data(),
-                 GL_STREAM_DRAW);
-    glEnableVertexAttribArray((GLuint)g_huPos);
-    glVertexAttribPointer((GLuint)g_huPos, 2, GL_FLOAT, GL_FALSE, 8, (void*)0);
-    glDrawArrays(GL_TRIANGLES, 0, (GLint)(v.size() / 2));
-    glDisableVertexAttribArray((GLuint)g_huPos);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glDeleteBuffers(1, &vbo);
-  }
+  stream_draw_2f(g_hud_vbo, g_huPos, v);
 }
 
 // ---------------- picture-in-picture robot camera ----------------
@@ -634,24 +756,14 @@ static void gles_draw_pip() {
     bv.insert(bv.end(), {bx0, bya, bx1, byb, bx0, byb});
     glUseProgram(g_hud_prog);
     glUniform4f(g_huColor, 1.f, 1.f, 1.f, 1.f);
-    GLuint bbo;
-    glGenBuffers(1, &bbo);
-    glBindBuffer(GL_ARRAY_BUFFER, bbo);
-    glBufferData(GL_ARRAY_BUFFER, bv.size() * sizeof(float), bv.data(), GL_STREAM_DRAW);
-    glEnableVertexAttribArray((GLuint)g_huPos);
-    glVertexAttribPointer((GLuint)g_huPos, 2, GL_FLOAT, GL_FALSE, 8, (void*)0);
-    glDrawArrays(GL_TRIANGLES, 0, (GLint)(bv.size() / 2));
-    glDisableVertexAttribArray((GLuint)g_huPos);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glDeleteBuffers(1, &bbo);
+    stream_draw_2f(g_hud_vbo, g_huPos, bv);
   }
   glUseProgram(g_pip_prog);
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, g_pip_tex);
   glUniform1i(g_pip_uTex, 0);
-  GLuint vbo;
-  glGenBuffers(1, &vbo);
-  glBindBuffer(GL_ARRAY_BUFFER, vbo);
+  if (!g_pip_vbo) glGenBuffers(1, &g_pip_vbo);
+  glBindBuffer(GL_ARRAY_BUFFER, g_pip_vbo);
   glBufferData(GL_ARRAY_BUFFER, v.size() * sizeof(float), v.data(),
                GL_STREAM_DRAW);
   glEnableVertexAttribArray((GLuint)g_pip_aPos);
@@ -662,7 +774,6 @@ static void gles_draw_pip() {
   glDisableVertexAttribArray((GLuint)g_pip_aPos);
   glDisableVertexAttribArray((GLuint)g_pip_aUV);
   glBindBuffer(GL_ARRAY_BUFFER, 0);
-  glDeleteBuffers(1, &vbo);
   glBindTexture(GL_TEXTURE_2D, 0);
 }
 
@@ -753,6 +864,17 @@ void gles_render_event_frame(SimGlue& glue, bool jitter, uint8_t* rgb, int w, in
   glUniformMatrix4fv(g_uMVP, 1, GL_FALSE, vp.m);
   for (int g = 0; g < m->ngeom; ++g) {
     if (m->geom_type[g] == mjGEOM_PLANE) continue;
+    // perception needs shape, not beauty: render the CHEAP collision meshes
+    // (group 3) + primitives (group 0), skip the high-poly visual meshes
+    // (group 2, ~500k faces) — the 100 Hz pass stays far inside budget.
+    if (m->geom_group[g] == 2) continue;
+    // skip translucent markers (zone plates share cube hue families and
+    // would pollute the color-binned event pipeline)
+    float a = 1.f;
+    const int matid = m->geom_matid[g];
+    if (matid >= 0) a = (float)m->mat_rgba[4 * matid + 3];
+    else a = (float)m->geom_rgba[4 * g + 3];
+    if (a < 0.95f) continue;
     draw_geom(m, pos, quat, g, 1.f);
   }
   glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, g_readback);
@@ -912,14 +1034,6 @@ void gles_render_status(int code, int win_w, int win_h, const char* sub) {
   if (v.empty()) return;
   glUseProgram(g_status_prog);
   glUniform4f(g_status_col, 1.f, 1.f, 1.f, 1.f);
-  GLuint vbo;
-  glGenBuffers(1, &vbo);
-  glBindBuffer(GL_ARRAY_BUFFER, vbo);
-  glBufferData(GL_ARRAY_BUFFER, v.size() * sizeof(float), v.data(), GL_STREAM_DRAW);
-  glEnableVertexAttribArray((GLuint)g_status_pos);
-  glVertexAttribPointer((GLuint)g_status_pos, 2, GL_FLOAT, GL_FALSE, 8, (void*)0);
-  glDrawArrays(GL_TRIANGLES, 0, (GLint)(v.size() / 2));
-  glDisableVertexAttribArray((GLuint)g_status_pos);
-  glBindBuffer(GL_ARRAY_BUFFER, 0);
-  glDeleteBuffers(1, &vbo);
+  if (!g_status_vbo) glGenBuffers(1, &g_status_vbo);
+  stream_draw_2f(g_status_vbo, g_status_pos, v);
 }

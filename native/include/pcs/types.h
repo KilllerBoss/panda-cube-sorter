@@ -35,14 +35,18 @@ enum Phase : int {
 static const char* kPhaseName[kNumPhases] = {
   "RESET", "HOME", "HOVER", "DESCEND", "GRASP", "LIFT", "TRANSPORT", "PLACE" };
 
-// home posture (computed via scene/check_kinematics.py)
+// home posture (Menagerie-Panda: FK geprueft, kollisionsfrei)
 constexpr float kHomeQ[kDof] = {0.009f, -0.211f, 0.040f, -1.305f, -0.005f, 3.063f, 0.004f};
-// gripper TENDON-LENGTH targets (tendon = sum of both finger slides; each
-// slide in [0, 0.025]). Open: 0.05 -> 95 mm. Closed: 0.004 -> servo squeezes
-// the 50 mm cube (contact at sum 0.017) with ~5 N clamp force.
-constexpr float kGripClosed = 0.006f;
-constexpr float kGripPre    = 0.022f;  // pre-close during descent (~55 mm gap)
-constexpr float kGripOpen   = 0.05f;
+// gripper TENDON-LENGTH targets (tendon = SUMME beider Finger-Slides;
+// jeder Slide in [0, 0.04], Pad-Abstand = 0.011 + 2*s).
+// Gemessen am echten Panda-Greifer (5-cm-Wuerfel):
+//   offen (Slide max)      -> 0.08  (Pad-Abstand 91 mm, ueber Raumdiagonale)
+//  Diagonalkontakt (~70.7) -> ~0.068
+//   Flankenkontakt (50 mm) -> ~0.040
+constexpr float kGripClosed = 0.038f;  // greift in beiden Faellen (2..15 N Klemmung)
+constexpr float kGripPre    = 0.064f;  // stationaer ueber der Diagonale greifen
+constexpr float kGripOpen   = 0.08f;
+constexpr float kGripOpenFinger = 0.04f;  // Slide-Position voll offen (Reset)
 
 // zone colors (order matches zone_red/green/blue/yellow bodies & cube colors)
 enum ColorId : int { COL_RED = 0, COL_GREEN, COL_BLUE, COL_YELLOW };
@@ -60,14 +64,11 @@ inline float minjerk_d(float s) {  // derivative g'(s) (per unit s)
   return 30.f * s * s * (s - 1.f) * (s - 1.f);
 }
 
-// Closed-form fold IK for the Panda-class chain with j3=j5=0 (no wrist rolls)
-// and the approach axis pointing straight down (j2+j4+j6 = pi/2).
-// Chain: L1 = 0.3985 (j2->j4), L2 = 0.3845 (j4->j6), L3 = 0.283 (j6->tcp).
-// Planar equations (arm plane after yaw j1):
-//   r       = L1 cos(a) + L2 cos(a+b)
-//   z - 0.012 = -(L1 sin(a) + L2 sin(a+b)),  a=j2, b=j4
-//   (0.012 = shoulder 0.333 - j6->tcp 0.321, tcp at the fingertip plane)
-// => exact 2-link solution; j6 = pi/2 - a - b. Valid for r in ~[0.30, 0.52].
+// Closed-form fold IK for the ORIGINAL simplified planar arm. DEPRECATED:
+// the scene now uses the real MuJoCo-Menagerie Panda (shoulder offset 0.0825,
+// quat chain, 45-degree hand mount) — the engine replaces this with a
+// warm-started damped-least-squares IK in sim_glue.cpp (solve_ik_down).
+// Kept only as documentation of the geometry family.
 inline void q_fold(float az, float r, float z, float* q) {
   const float L1 = 0.3985f, L2 = 0.3845f;
   const float kPi2 = 1.5707963f;

@@ -6,10 +6,10 @@
 #include <chrono>
 #include <algorithm>
 #include <random>
-
 namespace pcs {
 
 SimGlue::~SimGlue() {
+  if (d_ik_) mj_deleteData(d_ik_);
   if (d_) mj_deleteData(d_);
   if (m_) mj_deleteModel(m_);
 }
@@ -20,7 +20,138 @@ bool SimGlue::load_mjb_file(const char* path) {
   d_ = mj_makeData(m_);
   if (!d_) { err_ = "mj_makeData failed"; return false; }
   resolve_ids();
+  d_ik_ = mj_makeData(m_);
+  if (d_ik_) {
+    // fingers fully open in the IK scratch (no influence, but keeps
+    // kinematics sane)
+    for (int g = 0; g < 2; ++g)
+      if (jnt_grip_[g] >= 0)
+        d_ik_->qpos[m_->jnt_qposadr[jnt_grip_[g]]] = kGripOpenFinger;
+  }
   return true;
+}
+
+// ---- DLS-IK: Position + Ansatzachse (hand-z -> -z), Warmstart q_goal_ ----
+// Realer Panda: Schulteroffset 0.0825 + 45°-Handmontage machen die alte
+// planare Fold-Formel unbrauchbar. 12 Iterationen reichen im Warmstart
+// (< 0,1 ms; auf dem Desktop gegenueber der Python-Referenz verifiziert).
+namespace {
+// solves (H) x = g, H = 7x7 symmetric positive definite (Gauss, partial pivot)
+static bool solve7(float H[7][7], const float g[7], float x[7]) {
+  float A[7][8];
+  for (int i = 0; i < 7; ++i) {
+    for (int j = 0; j < 7; ++j) A[i][j] = H[i][j];
+    A[i][7] = g[i];
+  }
+  for (int c = 0; c < 7; ++c) {
+    int p = c;
+    for (int r = c + 1; r < 7; ++r)
+      if (fabsf(A[r][c]) > fabsf(A[p][c])) p = r;
+    if (fabsf(A[p][c]) < 1e-10f) return false;
+    if (p != c) for (int j = c; j < 8; ++j) { float t = A[c][j]; A[c][j] = A[p][j]; A[p][j] = t; }
+    const float piv = A[c][c];
+    for (int r = c + 1; r < 7; ++r) {
+      const float f = A[r][c] / piv;
+      if (f == 0.f) continue;
+      for (int j = c; j < 8; ++j) A[r][j] -= f * A[c][j];
+    }
+  }
+  for (int i = 6; i >= 0; --i) {
+    float s = A[i][7];
+    for (int j = i + 1; j < 7; ++j) s -= A[i][j] * x[j];
+    x[i] = s / A[i][i];
+  }
+  return true;
+}
+}  // namespace
+
+void SimGlue::solve_ik_down(float tx, float ty, float tz, float* q_out) {
+  if (!d_ik_ || site_tcp_ < 0 || hand_body_ < 0) {
+    for (int j = 0; j < 7; ++j) q_out[j] = q_goal_[j];
+    return;
+  }
+  float q[7];
+  for (int j = 0; j < 7; ++j) q[j] = q_goal_[j];
+  const int qadr[7] = {m_->jnt_qposadr[jnt_arm_[0]], m_->jnt_qposadr[jnt_arm_[1]],
+                       m_->jnt_qposadr[jnt_arm_[2]], m_->jnt_qposadr[jnt_arm_[3]],
+                       m_->jnt_qposadr[jnt_arm_[4]], m_->jnt_qposadr[jnt_arm_[5]],
+                       m_->jnt_qposadr[jnt_arm_[6]]};
+  const int vadr[7] = {m_->jnt_dofadr[jnt_arm_[0]], m_->jnt_dofadr[jnt_arm_[1]],
+                       m_->jnt_dofadr[jnt_arm_[2]], m_->jnt_dofadr[jnt_arm_[3]],
+                       m_->jnt_dofadr[jnt_arm_[4]], m_->jnt_dofadr[jnt_arm_[5]],
+                       m_->jnt_dofadr[jnt_arm_[6]]};
+  const float lambda2 = 0.08f * 0.08f;
+  float err2_best = 1e30f;
+  float q_best[7];
+  for (int j = 0; j < 7; ++j) q_best[j] = q[j];
+
+  for (int it = 0; it < 12; ++it) {
+    for (int j = 0; j < 7; ++j) d_ik_->qpos[qadr[j]] = q[j];
+    mj_kinematics(m_, d_ik_);
+    mj_comPos(m_, d_ik_);
+
+    const mjtNum* sp = d_ik_->site_xpos + 3 * site_tcp_;
+    const float epos[3] = {tx - (float)sp[0], ty - (float)sp[1], tz - (float)sp[2]};
+    // approach axis: hand local z must point DOWN (-z world)
+    const mjtNum* R = d_ik_->xmat + 9 * hand_body_;
+    const float zx[3] = {(float)R[2], (float)R[5], (float)R[8]};  // column 2
+    // cross(z, d) with d=(0,0,-1)
+    const float er[3] = {-zx[1], zx[0], 0.f};
+    const float err2 = epos[0]*epos[0] + epos[1]*epos[1] + epos[2]*epos[2]
+                     + er[0]*er[0] + er[1]*er[1] + er[2]*er[2];
+    if (err2 < err2_best) {
+      err2_best = err2;
+      for (int j = 0; j < 7; ++j) q_best[j] = q[j];
+    }
+    if (err2 < 1e-6f) break;
+
+    mj_jacSite(m_, d_ik_, jacp_.data(), jacr_.data(), site_tcp_);
+
+    float H[7][7] = {};
+    float g[7] = {};
+    for (int r = 0; r < 7; ++r) {
+      // task rows: 3 position + 3 rotation
+      float Jr[6];
+      for (int row = 0; row < 6; ++row) {
+        const mjtNum* J = (row < 3) ? (jacp_.data() + 3 * row)
+                                    : (jacr_.data() + 3 * (row - 3));
+        Jr[row] = (float)J[vadr[r]];
+      }
+      for (int c = 0; c < 7; ++c) {
+        float Jc[6];
+        for (int row = 0; row < 6; ++row) {
+          const mjtNum* J = (row < 3) ? (jacp_.data() + 3 * row)
+                                      : (jacr_.data() + 3 * (row - 3));
+          Jc[row] = (float)J[vadr[c]];
+        }
+        float dot = 0;
+        for (int row = 0; row < 6; ++row) dot += Jr[row] * Jc[row];
+        H[r][c] += dot;
+      }
+      const float e6[6] = {epos[0], epos[1], epos[2], er[0], er[1], er[2]};
+      float dot = 0;
+      for (int row = 0; row < 6; ++row) dot += Jr[row] * e6[row];
+      g[r] += dot;
+    }
+    for (int r = 0; r < 7; ++r) H[r][r] += lambda2;
+    float dq[7];
+    if (!solve7(H, g, dq)) break;
+    for (int j = 0; j < 7; ++j) {
+      q[j] += dq[j];
+      if (m_->jnt_limited[jnt_arm_[j]]) {
+        const float lo = (float)m_->jnt_range[2 * jnt_arm_[j]];
+        const float hi = (float)m_->jnt_range[2 * jnt_arm_[j] + 1];
+        q[j] = std::min(std::max(q[j], lo), hi);
+      }
+    }
+  }
+
+  // accept only if clearly better than staying put (never diverge)
+  if (err2_best < 0.25f * 0.25f) {
+    for (int j = 0; j < 7; ++j) q_out[j] = q_best[j];
+  } else {
+    for (int j = 0; j < 7; ++j) q_out[j] = q_goal_[j];
+  }
 }
 
 bool SimGlue::load_mjb_memory(const uint8_t* data, size_t size) {
@@ -35,6 +166,7 @@ void SimGlue::resolve_ids() {
   jacp_.assign(3 * (size_t)std::max<size_t>((size_t)m_->nv, 1), 0.0);
   jacr_.assign(3 * (size_t)std::max<size_t>((size_t)m_->nv, 1), 0.0);
   site_tcp_ = mj_name2id(m_, mjOBJ_SITE, "tcp");
+  hand_body_ = mj_name2id(m_, mjOBJ_BODY, "hand");
   for (int j = 0; j < 7; ++j) {
     char nm[32]; snprintf(nm, sizeof(nm), "joint%d", j + 1);
     jnt_arm_[j] = mj_name2id(m_, mjOBJ_JOINT, nm);
@@ -128,7 +260,7 @@ void SimGlue::reset_episode(uint64_t seed) {
     q_des_prev_[j] = kHomeQ[j];
   }
   for (int g = 0; g < 2; ++g) {
-    d_->qpos[m_->jnt_qposadr[jnt_grip_[g]]] = kGripOpen;
+    d_->qpos[m_->jnt_qposadr[jnt_grip_[g]]] = kGripOpenFinger;
     d_->qvel[m_->jnt_dofadr[jnt_grip_[g]]] = 0.f;
   }
   randomize_cubes(seed);
@@ -231,8 +363,8 @@ void SimGlue::step_cycle(Controller& c, ControllerOutput& out,
   } else if (out.task.joint_hold) {
     for (int j = 0; j < 7; ++j) q_goal_[j] = out.task.q_goal[j];
   } else {
-    const float rr = sqrtf(tgt[0] * tgt[0] + tgt[1] * tgt[1]);
-    q_fold(atan2f(tgt[1], tgt[0]), rr, tgt[2], q_goal_);
+    // real Panda chain: warm-started DLS-IK (approach axis down)
+    solve_ik_down(tgt[0], tgt[1], tgt[2], q_goal_);
   }
   have_tgt_ = true;
 

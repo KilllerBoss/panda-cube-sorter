@@ -142,20 +142,22 @@ static EGLContext g_ctx_loop = EGL_NO_CONTEXT;  // event-FBO owner
 static EGLContext g_ctx_view = EGL_NO_CONTEXT;  // interactive view (share group)
 
 // How the 100 Hz loop thread binds EGL. The loop only renders into an FBO and
-// glReadPixels — it never presents to the window. v1.0.1 made the loop share
-// the worker's WINDOW surface; drivers that refuse a window surface current
-// in two threads returned EGL errors there -> visible E7. Fallback chain,
-// first fit wins (chosen in init_egl, degraded live in execution_loop):
+// glReadPixels — it never presents to the window.
+// v1.2.0 FLICKER FIX: the loop thread is NEVER given a window surface again.
+// The old fallback chain (window-own / window-shared) let the loop thread
+// make a WINDOW surface current while the view thread was rendering to it —
+// drivers requeue the buffer chain on such a call, so the view intermittently
+// presented a stale buffer: the scene "jumped and came back".
+// New chain: surfaceless -> 1x1 pbuffer -> NO GL (loop keeps running, the
+// event pass is skipped, the last perception frame stays active).
 enum LoopBind {
   LB_SURFACELESS = 0,   // EGL_KHR_surfaceless_context (loop needs no surface)
   LB_PBUFFER = 1,       // dedicated 1x1 pbuffer
-  LB_WINDOW_OWN = 2,    // dedicated second window surface on the same window
-  LB_WINDOW_SHARED = 3  // legacy v1.0.1 behaviour (last resort)
+  LB_NONE = 2           // no EGL binding: loop runs without the event pass
 };
-static const char* kBindName[4] = {"surfaceless", "pbuffer", "window-own",
-                                   "window-shared"};
-static LoopBind g_loop_bind = LB_WINDOW_SHARED;
-static EGLSurface g_loop_surface = EGL_NO_SURFACE;  // pbuffer / own window surf.
+static const char* kBindName[3] = {"surfaceless", "pbuffer", "none"};
+static LoopBind g_loop_bind = LB_SURFACELESS;
+static EGLSurface g_loop_surface = EGL_NO_SURFACE;  // pbuffer
 
 static bool choose_config(EGLConfig* cfg, bool allow_pbuffer) {
   const EGLint attrs[] = {
@@ -181,8 +183,8 @@ static bool init_egl(ANativeWindow* win) {
       return false;
     }
     const char* ext = eglQueryString(g_display, EGL_EXTENSIONS);
-    if (ext && strstr(ext, "EGL_KHR_surfaceless_context"))
-      g_loop_bind = LB_SURFACELESS;
+    if (!(ext && strstr(ext, "EGL_KHR_surfaceless_context")))
+      g_loop_bind = LB_PBUFFER;
   }
 
   EGLConfig cfg = 0;
@@ -233,26 +235,20 @@ static bool init_egl(ANativeWindow* win) {
     }
   }
 
-  // v1.0.2 E7 fix — loop-thread surface, see LoopBind comment above
+  // v1.2.0 — loop-thread surface: surfaceless or pbuffer ONLY (never a
+  // window surface, see LoopBind comment)
   if (g_loop_bind == LB_SURFACELESS) {
     // nothing to create; the loop binds with EGL_NO_SURFACE
-  } else if (g_loop_surface == EGL_NO_SURFACE) {
-    if (cfg_has_pb) {
-      const EGLint pb[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
-      g_loop_surface = eglCreatePbufferSurface(g_display, cfg, pb);
-      if (g_loop_surface != EGL_NO_SURFACE) g_loop_bind = LB_PBUFFER;
-      else diag_add("eglCreatePbufferSurface failed 0x%x", eglGetError());
-    }
+  } else if (g_loop_surface == EGL_NO_SURFACE && cfg_has_pb) {
+    const EGLint pb[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
+    g_loop_surface = eglCreatePbufferSurface(g_display, cfg, pb);
     if (g_loop_surface == EGL_NO_SURFACE) {
-      g_loop_surface = eglCreateWindowSurface(g_display, cfg, win, nullptr);
-      if (g_loop_surface != EGL_NO_SURFACE) {
-        g_loop_bind = LB_WINDOW_OWN;
-      } else {
-        g_loop_bind = LB_WINDOW_SHARED;
-        diag_add("loop falls back to window-shared");
-      }
+      diag_add("eglCreatePbufferSurface failed 0x%x", eglGetError());
+      g_loop_bind = LB_NONE;
     }
   }
+  if (g_loop_bind == LB_PBUFFER && g_loop_surface == EGL_NO_SURFACE)
+    g_loop_bind = LB_NONE;
   diag_add("loop bind=%s", kBindName[g_loop_bind]);
   return true;
 }
@@ -289,10 +285,10 @@ static void write_error_report(int err) {
   FILE* f = fopen(p.c_str(), "w");
   if (!f) return;
   fprintf(f,
-          "PandaCubeSorter v1.0.2 | init error %d | sub 0x%X\n"
+          "PandaCubeSorter v1.2.0 | init error %d | sub 0x%X\n"
           "2=scene.mjb missing 3=weights.bin missing 4=storage write failed\n"
           "5=MJB load failed 6=weights invalid 7=EGL failed\n"
-          "loop bind=%d (0=surfaceless 1=pbuffer 2=window-own 3=window-shared)\n",
+          "loop bind=%d (0=surfaceless 1=pbuffer 2=none)",
           err, g_sub.load(), (int)g_loop_bind);
   {
     std::lock_guard<std::mutex> lk(g_diag_mutex);
@@ -310,16 +306,14 @@ static void execution_loop() {
   bool bound = false;
   for (int attempt = 0; attempt < 4 && !bound; ++attempt) {
     if (!g_running || !g_has_surface) break;
+    if (g_loop_bind == LB_NONE) break;
     EGLSurface draw = EGL_NO_SURFACE;
-    if (g_loop_bind == LB_PBUFFER || g_loop_bind == LB_WINDOW_OWN)
-      draw = g_loop_surface;
-    else if (g_loop_bind == LB_WINDOW_SHARED)
-      draw = g_surface;
+    if (g_loop_bind == LB_PBUFFER) draw = g_loop_surface;
     if (g_display == EGL_NO_DISPLAY ||
         (g_loop_bind != LB_SURFACELESS && draw == EGL_NO_SURFACE)) {
       diag_add("loop bind %s unusable (no display/surface)",
                kBindName[g_loop_bind]);
-      g_loop_bind = LB_WINDOW_SHARED;
+      g_loop_bind = LB_NONE;
       continue;
     }
     if (eglMakeCurrent(g_display, draw, draw, g_ctx_loop)) {
@@ -331,60 +325,40 @@ static void execution_loop() {
     diag_add("loop eglMakeCurrent(%s) failed 0x%x (attempt %d)",
              kBindName[g_loop_bind], e, attempt + 1);
     LOGE("loop eglMakeCurrent(%s) failed 0x%x", kBindName[g_loop_bind], e);
-    // degrade one step down the chain
-    if (g_loop_bind == LB_SURFACELESS) g_loop_bind = LB_PBUFFER;
-    else if (g_loop_bind == LB_PBUFFER) g_loop_bind = LB_WINDOW_OWN;
-    else g_loop_bind = LB_WINDOW_SHARED;
-    // a pbuffer/own-window surface may not exist yet — create it here if the
-    // window is still alive, otherwise skip to the legacy binding
-    if ((g_loop_bind == LB_PBUFFER || g_loop_bind == LB_WINDOW_OWN) &&
-        g_loop_surface == EGL_NO_SURFACE) {
-      EGLConfig cfg = 0;
-      if (choose_config(&cfg, true) || choose_config(&cfg, false)) {
-        if (g_loop_bind == LB_PBUFFER) {
+    // degrade: surfaceless -> pbuffer -> none (NEVER a window surface)
+    if (g_loop_bind == LB_SURFACELESS) {
+      g_loop_bind = LB_PBUFFER;
+      if (g_loop_surface == EGL_NO_SURFACE) {
+        EGLConfig cfg = 0;
+        if (choose_config(&cfg, true) || choose_config(&cfg, false)) {
           const EGLint pb[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
           g_loop_surface = eglCreatePbufferSurface(g_display, cfg, pb);
-        } else {
-          ANativeWindow* w = nullptr;
-          {
-            std::lock_guard<std::mutex> lk(g_window_mutex);
-            w = g_window;
-            if (w) ANativeWindow_acquire(w);
-          }
-          if (w) {
-            g_loop_surface = eglCreateWindowSurface(g_display, cfg, w, nullptr);
-            ANativeWindow_release(w);
-          }
         }
-        if (g_loop_surface == EGL_NO_SURFACE)
-          diag_add("loop surface create failed 0x%x", eglGetError());
       }
-      if ((g_loop_bind == LB_PBUFFER || g_loop_bind == LB_WINDOW_OWN) &&
-          g_loop_surface == EGL_NO_SURFACE)
-        g_loop_bind = LB_WINDOW_SHARED;
+      if (g_loop_surface == EGL_NO_SURFACE) g_loop_bind = LB_NONE;
+    } else {
+      g_loop_bind = LB_NONE;
     }
+    if (g_loop_bind == LB_NONE) break;
     std::this_thread::sleep_for(std::chrono::milliseconds(40));
   }
-  if (!bound) {
-    LOGE("loop thread: no EGL binding possible");
-    if (g_err.load() < ST_RUNNING) g_err = ERR_EGL;
-    write_error_report(g_err.load());
-    return;
+  if (g_loop_bind == LB_NONE) {
+    LOGW("loop thread: no EGL binding — event pass disabled, pipeline continues");
   }
   diag_add("loop bound via %s", kBindName[g_loop_bind]);
 
-  if (!g_gl_ready) {
+  // gles_init now runs on the VIEW thread (share group) before this loop
+  // starts; only bind-less setups never ran it — guard anyway.
+  if (!g_gl_ready && g_loop_bind != LB_NONE) {
     {
       std::lock_guard<std::mutex> lk(g_window_mutex);
-      if (!g_window) {
-        eglMakeCurrent(g_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        return;
+      if (g_window) {
+        gles_init(g_glue, ANativeWindow_getWidth(g_window),
+                  ANativeWindow_getHeight(g_window));
+        g_gl_ready = true;
+        LOGI("gles_init done (loop context, fallback)");
       }
-      gles_init(g_glue, ANativeWindow_getWidth(g_window),
-                ANativeWindow_getHeight(g_window));
     }
-    g_gl_ready = true;
-    LOGI("gles_init done (loop context)");
   }
 
   ControllerOutput out;
@@ -432,9 +406,16 @@ static void execution_loop() {
 
     if (!g_paused.load()) {
       // ---- physics + perception + control (the whole pipeline) ----
-      // GLES event-camera pass on THIS thread (context owner, single GL thread)
-      gles_render_event_frame(g_glue, refresh, g_frame.data(), kEvW, kEvH);
-      gles_push_pip(g_frame.data(), kEvW, kEvH);  // robot-camera PiP feed
+      // GLES event-camera pass on THIS thread — the loop is bound to a
+      // NON-window surface only (surfaceless/pbuffer), so it can never
+      // interfere with the view thread's buffer chain (v1.2.0 flicker fix).
+      if (g_loop_bind != LB_NONE && g_gl_ready.load()) {
+        gles_render_event_frame(g_glue, refresh, g_frame.data(), kEvW, kEvH);
+        // PiP shows the UNJITTERED camera: the refresh pulse (every 0.5 s)
+        // micro-shifts the sensor for the event pipeline — feeding that
+        // frame to the PiP made the robot view visibly jump twice a second.
+        if (!refresh) gles_push_pip(g_frame.data(), kEvW, kEvH);
+      }
       g_glue.step_cycle(g_ctrl, out, g_frame.data(), kEvW, kEvH, refresh);
       gles_publish_poses(g_glue.model(), g_glue.data());  // stable snapshot for the view thread
       refresh = (cyc % 50) == 49;  // micro-jitter pulse every 0.5 s
@@ -624,6 +605,16 @@ static void app_worker(ANativeActivity* activity) {
       worker_gl_current = true;
       eglSwapInterval(g_display, 1);
       diag_driver_info();
+      // v1.2.0: GL objects are built ONCE on the view context (share group).
+      // The loop thread only uses them via its own context — and only with a
+      // non-window binding. This also guarantees a visible scene even when
+      // the loop ends up without any EGL binding (LB_NONE).
+      if (!g_gl_ready.load()) {
+        gles_init(g_glue, ANativeWindow_getWidth(win),
+                  ANativeWindow_getHeight(win));
+        g_gl_ready = true;
+        LOGI("gles_init done (view context)");
+      }
       LOGI("EGL ready (share group: loop+view contexts)");
     }
 

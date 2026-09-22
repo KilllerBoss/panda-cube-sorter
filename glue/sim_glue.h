@@ -52,13 +52,18 @@ class SimGlue {
  private:
   void resolve_ids();
   void refresh_eval();
+  // warm-started damped-least-squares IK (approach axis down) for the real
+  // Menagerie Panda chain; runs on a private mjData, never on d_
+  void solve_ik_down(float tx, float ty, float tz, float* q_out);
 
   mjModel* m_ = nullptr;
   mjData*  d_ = nullptr;
+  mjData*  d_ik_ = nullptr;   // IK scratch (kinematics only)
   std::string err_;
 
   // ids
   int site_tcp_ = -1;
+  int hand_body_ = -1;
   int jnt_arm_[7] = {0}, act_arm_[7] = {0};
   int act_grip_ = -1;
   int jnt_grip_[2] = {-1, -1};

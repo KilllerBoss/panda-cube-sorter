@@ -6,10 +6,11 @@
 
 namespace pcs {
 
-// tcp sits at the fingertip plane: grasp = tcp at cube-center height (0.275);
-// carried cubes ride ~0.042 ABOVE tcp (pad center), palm stays clear of the table.
-static constexpr float kGraspZ   = 0.29f;    // pads beside cube mid-height, then close
-static constexpr float kPlaceZ0  = 0.283f;   // cube bottom touches table/stack
+// tcp sits at the fingertip plane of the REAL Panda hand (0.126 below the
+// hand origin; pads at 0.103): grasp = pads beside cube mid-height =>
+// tcp = 0.275 - 0.023 = 0.252; carried cubes ride ~0.023 above tcp.
+static constexpr float kGraspZ   = 0.252f;   // pads beside cube mid-height
+static constexpr float kPlaceZ0  = 0.252f;   // cube bottom touches table/stack
 static constexpr float kTransZ   = 0.42f;
 static constexpr float kStackDz  = 0.052f;   // cube height + clearance
 static constexpr float kSlotScoreMin = -10.f;  // relative selection only
@@ -124,15 +125,17 @@ void TaskLayer::update(const TaskInput& in, TaskOutput& out) {
 
     case PH_HOVER: {
       have_grab_ = false;
-      // CARRY transit: pure yaw sweep at safe height toward the target cube
+      // CARRY transit: warm-started IK drives the tcp above the target cube
+      // at safe height (real Panda chain — the old planar q_carry is gone)
       out.s = phase_t_ / phase_dur_;
       out.ik_needed = false;
-      out.joint_hold = true;
-      float az = 0.f;
-      if (cur_slot_ >= 0 && cur_slot_ < in.n_cubes)
-        az = atan2f(in.cubes[cur_slot_].y, in.cubes[cur_slot_].x);
-      q_carry(az, out.q_goal);
-      out.tcp_target[0] = 0.40f; out.tcp_target[1] = 0.f; out.tcp_target[2] = 0.43f;
+      out.joint_hold = false;
+      if (cur_slot_ >= 0 && cur_slot_ < in.n_cubes) {
+        const CubeSlot& c = in.cubes[cur_slot_];
+        out.tcp_target[0] = c.x;
+        out.tcp_target[1] = c.y;
+      }
+      out.tcp_target[2] = kTransZ;
       out.grip_target = kGripOpen;
       if (out.s >= 1.f) start_phase(PH_DESCEND, in, out);
       break;
@@ -148,11 +151,12 @@ void TaskLayer::update(const TaskInput& in, TaskOutput& out) {
         out.tcp_target[1] = c.y + wiggle_dy_;
       }
       out.tcp_target[2] = kGraspZ;
-      // funnel: wide (83 mm, over-diagonal) all the way down; the closing to
-      // 50 mm happens STATIONARY in PH_GRASP (symmetric mid-height grasp)
+      // funnel: fully open (91 mm, over-diagonal) all the way down; the
+      // pre-close to diagonal-contact (stationary) happens at the bottom and
+      // the final close to kGripClosed in PH_GRASP
       float g;
       if (out.s < 0.5f) g = kGripOpen;
-      else g = kGripOpen + (0.0377f - kGripOpen) * std::min(1.f, (out.s - 0.5f) / 0.2f);
+      else g = kGripOpen + (kGripPre - kGripOpen) * std::min(1.f, (out.s - 0.5f) / 0.2f);
       out.grip_target = g;
       if ((out.s >= 1.f && dist3(in.tcp_actual, out.tcp_target) < 0.02f) || phase_t_ >= 4.f)
         start_phase(PH_GRASP, in, out);
