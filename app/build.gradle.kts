@@ -11,8 +11,8 @@ android {
         applicationId = "dev.pandasorter"
         minSdk = 31
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.0.1"
         ndk { abiFilters += listOf("arm64-v8a") }
         externalNativeBuild {
             cmake { arguments += listOf("-DANDROID_STL=c++_shared") }
@@ -43,7 +43,11 @@ android {
     }
 
     packagingOptions {
-        jniLibs { useLegacyPackaging = false }
+        jniLibs {
+            // extract to disk at install: avoids direct-APK dlopen alignment
+            // issues on 4 KB devices; ELF alignment itself is now 16 KB anyway
+            useLegacyPackaging = true
+        }
     }
 }
 

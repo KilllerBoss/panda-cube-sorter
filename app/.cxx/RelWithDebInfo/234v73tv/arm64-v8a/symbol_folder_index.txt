@@ -1,1 +1,0 @@
-/home/z/my-project/download/panda-cube-sorter/app/build/intermediates/cxx/RelWithDebInfo/234v73tv/obj/arm64-v8a

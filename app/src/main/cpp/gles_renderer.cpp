@@ -6,7 +6,9 @@
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
 #include <android/log.h>
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <vector>
 
@@ -337,3 +339,100 @@ void gles_render_event_frame(SimGlue& glue, bool jitter, uint8_t* rgb, int w, in
 
 void out_stats_set(const CycleStats& st) { g_last_stats = st; }
 void out_task_set(const TaskOutput& t) { g_last_task = t; }
+
+// ---------------- status / error screen (never-black guarantee) ----------------
+// Own program + geometry on the calling thread's context; works BEFORE
+// gles_init so loading and error states are always visible.
+static GLuint g_status_prog = 0;
+static GLint g_status_pos = -1, g_status_col = -1;
+
+void gles_set_window_size(int w, int h) {
+  if (w > 0 && h > 0) { g_win_w = w; g_win_h = h; }
+}
+int gles_win_w() { return g_win_w; }
+int gles_win_h() { return g_win_h; }
+
+// 3x5 pixel glyphs, rows top->bottom (bit 2 = leftmost column)
+static const uint8_t kFont[12][5] = {
+    {7, 5, 5, 5, 7},   // 0
+    {2, 6, 2, 2, 7},   // 1
+    {7, 1, 7, 4, 7},   // 2
+    {7, 1, 7, 1, 7},   // 3
+    {5, 5, 7, 1, 1},   // 4
+    {7, 4, 7, 1, 7},   // 5
+    {7, 4, 7, 5, 7},   // 6
+    {7, 1, 1, 2, 2},   // 7
+    {7, 5, 7, 5, 7},   // 8
+    {7, 5, 7, 1, 7},   // 9
+    {7, 4, 6, 4, 7},   // E
+    {4, 4, 4, 4, 7}};  // L
+
+static const uint8_t* glyph_of(char c) {
+  if (c >= '0' && c <= '9') return kFont[c - '0'];
+  if (c == 'E') return kFont[10];
+  if (c == 'L') return kFont[11];
+  return kFont[0];
+}
+
+void gles_render_status(int code, int win_w, int win_h) {
+  if (!g_status_prog) {
+    g_status_prog = make_program(kHudVS, kHudFS);
+    g_status_pos = glGetAttribLocation(g_status_prog, "aPos");
+    g_status_col = glGetUniformLocation(g_status_prog, "uColor");
+  }
+  glViewport(0, 0, win_w, win_h);
+  const bool error = code >= 2;
+  if (error) {
+    glClearColor(0.42f, 0.06f, 0.06f, 1.f);  // dark red: fatal
+  } else {
+    glClearColor(0.52f, 0.40f, 0.08f, 1.f);  // amber: loading
+  }
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+  glDisable(GL_DEPTH_TEST);
+
+  char text[3] = {'L', '0', 0};
+  if (error) {
+    text[0] = 'E';
+    text[1] = (char)('0' + (code % 10));
+  }
+
+  const int scale = std::max(8, std::min(win_w, win_h) / 24);
+  const int gw = 3 * scale, gap = scale, gh = 5 * scale;
+  int total_w = 0;
+  for (const char* p = text; *p; ++p) total_w += gw + gap;
+  total_w -= gap;
+  const float x0 = (win_w - total_w) * 0.5f;
+  const float y0 = (win_h - gh) * 0.5f;
+
+  std::vector<float> v;
+  int gx = 0;
+  for (const char* p = text; *p; ++p, gx += gw + gap) {
+    const uint8_t* g = glyph_of(*p);
+    for (int r = 0; r < 5; ++r) {
+      for (int c = 0; c < 3; ++c) {
+        if (!((g[r] >> (2 - c)) & 1)) continue;
+        const float px = x0 + gx + c * scale;
+        const float py = y0 + r * scale;
+        const float xa = 2.f * px / win_w - 1.f;
+        const float xb = 2.f * (px + scale) / win_w - 1.f;
+        const float ya = 1.f - 2.f * py / win_h;
+        const float yb = 1.f - 2.f * (py + scale) / win_h;
+        v.insert(v.end(), {xa, ya, xb, ya, xb, yb});
+        v.insert(v.end(), {xa, ya, xb, yb, xa, yb});
+      }
+    }
+  }
+  if (v.empty()) return;
+  glUseProgram(g_status_prog);
+  glUniform4f(g_status_col, 1.f, 1.f, 1.f, 1.f);
+  GLuint vbo;
+  glGenBuffers(1, &vbo);
+  glBindBuffer(GL_ARRAY_BUFFER, vbo);
+  glBufferData(GL_ARRAY_BUFFER, v.size() * sizeof(float), v.data(), GL_STREAM_DRAW);
+  glEnableVertexAttribArray((GLuint)g_status_pos);
+  glVertexAttribPointer((GLuint)g_status_pos, 2, GL_FLOAT, GL_FALSE, 8, (void*)0);
+  glDrawArrays(GL_TRIANGLES, 0, (GLint)(v.size() / 2));
+  glDisableVertexAttribArray((GLuint)g_status_pos);
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+  glDeleteBuffers(1, &vbo);
+}

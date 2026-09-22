@@ -7,7 +7,7 @@ Farben zu sortieren und in Zonen zu stapeln — **ohne Internet, ohne Cloud, mit
 100-Hz-Taktung und kontinuierlicher Online-Adaption**.
 
 **Repo:** https://github.com/KilllerBoss/panda-cube-sorter
-**APK-Download:** [Release v1.0.0](https://github.com/KilllerBoss/panda-cube-sorter/releases/download/v1.0.0/PandaCubeSorter-v1.0.0-release.apk)
+**APK-Download:** [Release v1.0.1](https://github.com/KilllerBoss/panda-cube-sorter/releases/download/v1.0.1/PandaCubeSorter-v1.0.1-release.apk)
 
 ---
 
@@ -27,13 +27,42 @@ Farben zu sortieren und in Zonen zu stapeln — **ohne Internet, ohne Cloud, mit
 | NativeActivity + OpenGL-ES-3.0-Rendering + HUD | implementiert | `app/src/main/cpp/` |
 | Trainings-Pipeline (Collect → NMF → KAN → Heads → Export) | implementiert, lauffähig | `toolchain/` |
 | Desktop-Harness (Benchmarks + Erfolgsquote, ohne Android) | implementiert | `desktop/`, `scripts/run_harness.sh` |
-| Signierte Release-APK (minSdk 31, arm64-v8a, offline) | **erzeugt & publiziert** | `apk/PandaCubeSorter-v1.0.0-release.apk` |
+| Signierte Release-APK (minSdk 31, arm64-v8a, offline) | **erzeugt & publiziert** | `apk/PandaCubeSorter-v1.0.1-release.apk` |
+
+## Änderungen in v1.0.1 — Black-Screen-Fix
+
+**Problem:** Auf Geräten mit 16-KB-Kernel-Pages (neue Snapdragon-Flaggschiffe, inkl. S26 Ultra)
+wurden die nativen Bibliotheken der v1.0.0 vom Dynamic-Linker **abgelehnt** — die App startete
+und zeigte nur Schwarz. Zwei weitere Fehler wurden zusätzlich behoben:
+
+1. **16-KB-ELF-Ausrichtung:** `libmujoco.so` und `libpanda_sorter.so` waren nur 4 KB ausgerichtet
+   (v1.0.0). Beide sind jetzt mit `-Wl,-z,max-page-size=16384` gelinkt; `libc++_shared.so` war
+   bereits korrekt. `useLegacyPackaging=true` extrahiert die Bibliotheken zusätzlich beim Install.
+2. **GL-Kontext über zwei Threads:** Event-Kamera-FBO und 3D-Ansicht teilten sich einen
+   EGLContext — ein Kontext kann aber nur auf einem Thread `current` sein; GL-Aufrufe wurden
+   stillschweigend verworfen. Jetzt: zwei Kontexte aus **einer** Share-Group
+   (Loop-Thread besitzt das Event-FBO, Worker-Thread rendert die Ansicht).
+3. **Nie wieder Schwarzbild:** Jeder Initialisierungsfehler zeigt jetzt einen farbcodierten
+   Status-Bildschirm statt Schwarz. Zusätzlich fehlerfreie Window-Recreate-Behandlung
+   (vorher: Schwarz nach App-Wechsel/Rotate).
+
+| Anzeige | Bedeutung |
+|---|---|
+| Bernstein + **L0** | Laden (Szene/Gewichte/GL-Warmup) — wenige Sekunden |
+| Rot + **E2** | `scene.mjb` fehlt in der APK |
+| Rot + **E3** | `weights.bin` fehlt in der APK |
+| Rot + **E4** | Interner Speicher nicht schreibbar |
+| Rot + **E5** | MuJoCo-Modell konnte nicht geladen werden (`adb logcat` für Details) |
+| Rot + **E6** | `weights.bin` ungültig (Format-/Versionsfehler) |
+| Rot + **E7** | EGL/GLES-3.0-Initialisierung fehlgeschlagen |
+
+Bei **E5** hilft: `adb logcat -s panda-sorter` — der MuJoCo-Fehlertext steht dort im Klartext.
 
 ## Schnellstart auf dem S26 Ultra
 
 ```bash
 # 1) APK herunterladen (Release-Seite) oder aus apk/ nehmen
-adb install -r apk/PandaCubeSorter-v1.0.0-release.apk
+adb install -r apk/PandaCubeSorter-v1.0.1-release.apk
 
 # 2) App starten ("Panda Cube Sorter"), Flugzeugmodus an — sie läuft autark
 

@@ -11,3 +11,6 @@ build*/
 .android-home/
 local.properties
 *.log
+.gradle/
+app/.cxx/
+app/build/

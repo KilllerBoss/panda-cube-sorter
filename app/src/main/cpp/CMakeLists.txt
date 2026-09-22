@@ -44,5 +44,12 @@ target_link_libraries(panda_sorter
     ${log-lib} ${android-lib} ${egl-lib} ${gles-lib}
 )
 
+# 16 KB kernel page support (mandatory on new Samsung/Qualcomm flagships):
+# without this the dynamic linker refuses to load the library -> black screen
+target_link_options(panda_sorter PRIVATE
+    "-Wl,-z,max-page-size=16384"
+    "-Wl,-z,common-page-size=16384"
+)
+
 #骁龙 8 Elite (S26 Ultra): performance cores only for this library
 set_property(TARGET panda_sorter APPEND_STRING PROPERTY COMPILE_FLAGS " -O3 -ffp-contract=fast")

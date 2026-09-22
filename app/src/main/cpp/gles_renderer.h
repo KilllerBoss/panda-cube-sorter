@@ -22,3 +22,12 @@ void gles_render_hud(const pcs::CycleStats& st, const pcs::TaskOutput& task);
 // HUD data bridge (control thread -> render thread)
 void out_stats_set(const pcs::CycleStats& st);
 void out_task_set(const pcs::TaskOutput& t);
+
+// window size tracking (safe before gles_init; also updates the view camera)
+void gles_set_window_size(int w, int h);
+int gles_win_w();
+int gles_win_h();
+
+// status / error screen: code 0 = loading (amber), >=2 = error (red + code)
+// renders "L0" or "E<n>" with a 3x5 pixel font, works without gles_init
+void gles_render_status(int code, int win_w, int win_h);
