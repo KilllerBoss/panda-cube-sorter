@@ -13,6 +13,7 @@
             android:name="android.app.NativeActivity"
             android:label="Panda Cube Sorter"
             android:exported="true"
+            android:screenOrientation="landscape"
             android:configChanges="orientation|keyboardHidden|screenSize">
             <meta-data
                 android:name="android.app.lib_name"

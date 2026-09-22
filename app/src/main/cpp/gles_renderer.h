@@ -28,6 +28,10 @@ void gles_set_window_size(int w, int h);
 int gles_win_w();
 int gles_win_h();
 
+// pose snapshot: the 100 Hz loop thread publishes after each cycle; the view
+// thread renders from this stable copy (no mjData race)
+void gles_publish_poses(const mjModel* m, const mjData* d);
+
 // status / error screen: code 0 = loading (amber), >=2 = error (red + code)
 // renders "L0" or "E<n>" with a 3x5 pixel font, works without gles_init.
 // `sub` (optional) draws a smaller hex line below (e.g. "0X3009") — glyphs

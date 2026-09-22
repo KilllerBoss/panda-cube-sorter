@@ -87,11 +87,37 @@ Zusätzlich:
 Bei hartnäckigem E7: `adb logcat -d -s panda-sorter > pcs_log.txt` schicken — der Report
 enthält dann den exakten Treiber/Fehlerpunkt.
 
+## Änderungen in v1.0.3 — Render-Fix (graue Szene + Dreiecks-Chaos)
+
+**Feldbericht v1.0.2:** App läuft (E7 weg!), aber die Szene zeigt nur Grau, sporadisch
+einen weißen Balken und wilde Dreiecke in der Mitte. Diagnose — drei unabhängige
+Render-Bugs im GLES-Renderer (er wurde auf dem Gerät zum ersten Mal sichtbar ausgeführt):
+
+1. **Cube-VBO-Format falsch:** Vertex-Daten als Triangle-Strip gespeichert (15 Floats/Face),
+   aber mit `GL_TRIANGLES, count=36` gelesen → der Vertex-Fetch lief **über das Buffer-Ende
+   hinaus** und interpretierte Speicher-Müll als Geometrie — das waren die "random Dreiecke".
+2. **Cylinder-VBO ohne Normalen:** nur Positionen gespeichert; der `aNrm`-Attribut-Pointer
+   las Positionen als Normalen → kaputte Beleuchtung.
+3. **Matrizen-Mathe gebrochen:** `Mat4::operator*` nutzte eine row-major-Formel auf
+   column-major-Daten (GL-Konvention) — jedes Matrixprodukt war effektiv transponiert →
+   alle Projektionen landeten als Chaos in der Bildmitte. Zusätzlich transponierte
+   `body_transform` die Rotation.
+
+**Fix:**
+- Cube: 36 Verts als echte `GL_TRIANGLES`, interleaved pos+normal (stride 24).
+- Zylinder: interleaved mit echten radialen/Kappen-Normalen.
+- `Mat4::operator*` und `body_transform` korrekt column-major; Event-Kamera nutzt denselben
+  Pfad → auch die Event-Bilder (Perzeption!) sind geometrisch jetzt korrekt.
+- **Pose-Snapshot:** der 100-Hz-Loop publiziert nach jedem Zyklus eine stabile Kopie der
+  Body-Posen; der View-Thread liest die Kopie statt parallel `mjData` zu lesen (Data-Race weg).
+- **Landscape-Orientierung** fixiert (vorher erschien der HUD-Balken seitlich gedreht).
+- HUD-Balkenbreite auf Budget-Grenze gekappt.
+
 ## Schnellstart auf dem S26 Ultra
 
 ```bash
 # 1) APK herunterladen (Release-Seite) oder aus apk/ nehmen
-adb install -r apk/PandaCubeSorter-v1.0.2-release.apk
+adb install -r apk/PandaCubeSorter-v1.0.3-release.apk
 
 # 2) App starten ("Panda Cube Sorter"), Flugzeugmodus an — sie läuft autark
 

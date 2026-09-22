@@ -396,6 +396,7 @@ static void execution_loop() {
     // GLES event-camera pass on THIS thread (context owner, single GL thread)
     gles_render_event_frame(g_glue, refresh, g_frame.data(), kEvW, kEvH);
     g_glue.step_cycle(g_ctrl, out, g_frame.data(), kEvW, kEvH, refresh);
+    gles_publish_poses(g_glue.model(), g_glue.data());  // stable snapshot for the view thread
     refresh = (cyc % 50) == 49;  // micro-jitter pulse every 0.5 s
     out_stats_set(out.stats);
     out_task_set(out.task);

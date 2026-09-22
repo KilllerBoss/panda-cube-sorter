@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, "panda-sorter", __VA_ARGS__)
@@ -19,13 +20,16 @@ using namespace pcs;
 // ---------------- tiny math (column-major mat4) ----------------
 struct Mat4 {
   float m[16];
+  // column-major storage (m[4*col+row]) to match glUniformMatrix4fv(GL_FALSE)
+  // and the uMVP * vec4 shader order. v1.0.2 had a row-major formula here,
+  // which silently transposed every product -> garbage projections.
   Mat4 operator*(const Mat4& o) const {
     Mat4 r{};
-    for (int row = 0; row < 4; ++row)
-      for (int c = 0; c < 4; ++c) {
+    for (int c = 0; c < 4; ++c)
+      for (int row = 0; row < 4; ++row) {
         float acc = 0;
-        for (int k = 0; k < 4; ++k) acc += m[4*row+k] * o.m[4*k+c];
-        r.m[4*row+c] = acc;
+        for (int k = 0; k < 4; ++k) acc += m[4*k+row] * o.m[4*c+k];
+        r.m[4*c+row] = acc;
       }
     return r;
   }
@@ -62,22 +66,46 @@ struct Mat4 {
   }
 };
 
-static void quat_to_mat(const double q[4], float R[9]) {
-  // MuJoCo quat = (w,x,y,z)
-  const float w=(float)q[0],x=(float)q[1],y=(float)q[2],z=(float)q[3];
+static void quat_to_mat(const float q[4], float R[9]) {
+  // MuJoCo quat = (w,x,y,z); R is row-major
+  const float w=q[0],x=q[1],y=q[2],z=q[3];
   R[0]=1-2*(y*y+z*z); R[1]=2*(x*y-w*z); R[2]=2*(x*z+w*y);
   R[3]=2*(x*y+w*z);   R[4]=1-2*(x*x+z*z); R[5]=2*(y*z-w*x);
   R[6]=2*(x*z-w*y);   R[7]=2*(y*z+w*x);   R[8]=1-2*(x*x+y*y);
 }
 
-static void body_transform(const mjModel* m, const mjData* d, int body,
-                           float M[16]) {
-  const mjtNum* p = d->xpos + 3 * body;
+// ---------------- pose snapshot (physics thread -> render threads) ----------------
+// The 100 Hz loop mutates mjData; the view thread must not read it mid-step.
+// The loop publishes one stable float snapshot per cycle (gles_publish_poses)
+// and both render paths draw from a copied snapshot — no data race.
+static std::mutex g_pose_mtx;
+static std::vector<float> g_pose_pos;   // 3 floats per body
+static std::vector<float> g_pose_quat;  // 4 floats per body (w,x,y,z)
+
+void gles_publish_poses(const mjModel* m, const mjData* d) {
+  std::lock_guard<std::mutex> lk(g_pose_mtx);
+  g_pose_pos.resize(3 * m->nbody);
+  g_pose_quat.resize(4 * m->nbody);
+  for (int b = 0; b < m->nbody; ++b) {
+    for (int i = 0; i < 3; ++i) g_pose_pos[3*b+i] = (float)d->xpos[3*b+i];
+    for (int i = 0; i < 4; ++i) g_pose_quat[4*b+i] = (float)d->xquat[4*b+i];
+  }
+}
+
+static void copy_poses(std::vector<float>& pos, std::vector<float>& quat) {
+  std::lock_guard<std::mutex> lk(g_pose_mtx);
+  pos = g_pose_pos;
+  quat = g_pose_quat;
+}
+
+static void body_transform(int body, const std::vector<float>& pos,
+                           const std::vector<float>& quat, float M[16]) {
+  const float* p = &pos[3 * body];
   float R[9];
-  quat_to_mat(d->xquat + 4 * body, R);
-  for (int i = 0; i < 3; ++i) {
-    for (int j = 0; j < 3; ++j) M[4*i+j] = (float)R[3*i+j];
-    M[12+i] = (float)p[i];
+  quat_to_mat(&quat[4 * body], R);
+  for (int c = 0; c < 3; ++c) {          // column-major: m[4*col+row]
+    for (int r = 0; r < 3; ++r) M[4*c+r] = R[3*r+c];
+    M[12+c] = p[c];
   }
   M[3]=M[7]=M[11]=0.f; M[15]=1.f;
 }
@@ -137,7 +165,9 @@ static GLuint make_program(const char* vs, const char* fs) {
 }
 
 static void push_cube(std::vector<float>& v) {
-  // 6 faces, normal + 4 positions (triangle strip per face)
+  // 6 faces, each: normal + 4 corners (strip order a,b,c,d). Expanded to
+  // 2 triangles x 3 verts per face = 36 verts, interleaved pos+nrm (stride 24)
+  // to match draw_geom's GL_TRIANGLES/36/24 expectations.
   static const float F[6][15] = {
       { 1,0,0,  1,-1,-1, 1,1,-1, 1,1,1, 1,-1,1},
       {-1,0,0, -1,-1,1, -1,1,1, -1,1,-1, -1,-1,-1},
@@ -145,24 +175,40 @@ static void push_cube(std::vector<float>& v) {
       {0,-1,0, -1,-1,-1, 1,-1,-1, 1,-1,1, -1,-1,1},
       {0,0, 1,  1,-1,1, -1,-1,1, -1,1,1, 1,1,1},
       {0,0,-1, -1,-1,-1, 1,-1,-1, 1,1,-1, -1,1,-1}};
-  for (const auto& f : F)
-    for (int i = 0; i < 15; ++i) v.push_back(f[i]);
+  for (const auto& f : F) {
+    const float* n = f;      // 3 floats normal
+    const float* c = f + 3;  // 4 corners
+    static const int idx[6] = {0, 1, 2, 0, 2, 3};
+    for (int k = 0; k < 6; ++k) {
+      const float* p = c + 3 * idx[k];
+      v.insert(v.end(), {p[0], p[1], p[2], n[0], n[1], n[2]});
+    }
+  }
 }
 
 static void push_cylinder(std::vector<float>& v) {
   // unit cylinder along +x, r=1, length 1 centered at origin; 12 segments
+  // interleaved pos+nrm (stride 24) — v1.0.2 stored bare positions, so the
+  // normals attribute read garbage.
   const int N = 12;
   for (int i = 0; i < N; ++i) {
     const float a0 = 2.f * (float)M_PI * i / N, a1 = 2.f * (float)M_PI * (i + 1) / N;
     const float c0 = cosf(a0), s0 = sinf(a0), c1 = cosf(a1), s1 = sinf(a1);
-    // side quad (two tris), normal = radial
-    v.insert(v.end(), {c0, s0, 0.f,  c1, s1, 0.f,  c1, s1, 1.f});
-    v.insert(v.end(), {c0, s0, 0.f,  c1, s1, 1.f,  c0, s0, 1.f});
-    // caps (normal ±x)
-    v.insert(v.end(), {1.f, 0.f, 0.f,  1.f, 0.f, 0.f,  1.f, 0.f, 0.f});
-    v.insert(v.end(), {0.5f, c0, s0,  0.5f, c1, s1,  0.5f, 0.f, 0.f});
-    v.insert(v.end(), {-1.f, 0.f, 0.f, -1.f, 0.f, 0.f, -1.f, 0.f, 0.f});
-    v.insert(v.end(), {-0.5f, c1, s1, -0.5f, c0, s0, -0.5f, 0.f, 0.f});
+    // side (2 tris), radial normals
+    v.insert(v.end(), {c0, s0, 0.f,  c0, s0, 0.f});
+    v.insert(v.end(), {c1, s1, 0.f,  c1, s1, 0.f});
+    v.insert(v.end(), {c1, s1, 1.f,  c1, s1, 0.f});
+    v.insert(v.end(), {c0, s0, 0.f,  c0, s0, 0.f});
+    v.insert(v.end(), {c1, s1, 1.f,  c1, s1, 0.f});
+    v.insert(v.end(), {c0, s0, 1.f,  c0, s0, 0.f});
+    // +x cap (normal +x)
+    v.insert(v.end(), {1.f, 0.f, 0.f,  1.f, 0.f, 0.f});
+    v.insert(v.end(), {0.5f, c0, s0,  1.f, 0.f, 0.f});
+    v.insert(v.end(), {0.5f, c1, s1,  1.f, 0.f, 0.f});
+    // -x cap (normal -x)
+    v.insert(v.end(), {-1.f, 0.f, 0.f,  -1.f, 0.f, 0.f});
+    v.insert(v.end(), {-0.5f, c1, s1,  -1.f, 0.f, 0.f});
+    v.insert(v.end(), {-0.5f, c0, s0,  -1.f, 0.f, 0.f});
   }
 }
 
@@ -185,7 +231,7 @@ void gles_init(SimGlue& glue, int win_w, int win_h) {
   glBufferData(GL_ARRAY_BUFFER, v.size() * 4, v.data(), GL_STATIC_DRAW);
   v.clear();
   push_cylinder(v);
-  g_cyl_count = (int)v.size() / 3;
+  g_cyl_count = (int)v.size() / 6;  // 6 floats (pos+nrm) per vertex
   glGenBuffers(1, &g_cyl_vbo);
   glBindBuffer(GL_ARRAY_BUFFER, g_cyl_vbo);
   glBufferData(GL_ARRAY_BUFFER, v.size() * 4, v.data(), GL_STATIC_DRAW);
@@ -194,11 +240,12 @@ void gles_init(SimGlue& glue, int win_w, int win_h) {
   LOGW("gles_init done %dx%d", win_w, win_h);
 }
 
-// draw one geom (box or capsule) with color
-static void draw_geom(const mjModel* m, const mjData* d, int g, float alpha) {
+// draw one geom (box or capsule) with color; poses come from the snapshot
+static void draw_geom(const mjModel* m, const std::vector<float>& pos,
+                      const std::vector<float>& quat, int g, float alpha) {
   const int body = m->geom_bodyid[g];
   float M[16];
-  body_transform(m, d, body, M);
+  body_transform(body, pos, quat, M);
   const mjtNum* size = m->geom_size + 3 * g;
   const int type = m->geom_type[g];
   const float* rgba = m->geom_rgba + 4 * g;
@@ -220,6 +267,7 @@ static void draw_geom(const mjModel* m, const mjData* d, int g, float alpha) {
     glUniformMatrix4fv(g_uModel, 1, GL_FALSE, model.m);
   } else if (type == mjGEOM_PLANE) {
     scale.m[0] = (float)size[0]; scale.m[5] = (float)size[1];
+    scale.m[10] = 0.01f;  // thin slab — MuJoCo planes have no thickness
     Mat4 model = Mb * scale;
     glUniformMatrix4fv(g_uModel, 1, GL_FALSE, model.m);
   } else {
@@ -240,7 +288,9 @@ static void draw_geom(const mjModel* m, const mjData* d, int g, float alpha) {
 
 void gles_render_view(SimGlue& glue, Controller& ctrl) {
   const mjModel* m = glue.model();
-  const mjData* d = glue.data();
+  std::vector<float> pos, quat;
+  copy_poses(pos, quat);
+  if (pos.size() < (size_t)3 * m->nbody) return;  // no snapshot yet
   glViewport(0, 0, g_win_w, g_win_h);
   glClearColor(0.09f, 0.10f, 0.12f, 1.f);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -257,9 +307,9 @@ void gles_render_view(SimGlue& glue, Controller& ctrl) {
   // floor + table + zones + arm + hand + cubes (skip invisible geoms)
   for (int g = 0; g < m->ngeom; ++g) {
     if (m->geom_type[g] == mjGEOM_PLANE) {
-      draw_geom(m, d, g, 1.f);
+      draw_geom(m, pos, quat, g, 1.f);
     } else if (m->geom_contype[g] != 0 || m->geom_conaffinity[g] != 0) {
-      draw_geom(m, d, g, 1.f);
+      draw_geom(m, pos, quat, g, 1.f);
     }
   }
   glDisable(GL_DEPTH_TEST);
@@ -272,7 +322,7 @@ void gles_render_hud(const CycleStats& st, const TaskOutput& task) {
   glUniform4f(g_huColor, 1.f, 1.f, 1.f, 1.f);
   // tiny status bar: one triangle strip at the bottom whose width encodes the
   // cycle time fraction (full width = 10 ms budget used)
-  const float w = 2.f * ((float)st.t_total / 10000.f);
+  const float w = std::min(2.f, 2.f * ((float)st.t_total / 10000.f));
   float quad[8] = {-1.f, -1.f, -1.f + w, -1.f, -1.f, -0.965f, -1.f + w, -0.965f};
   GLuint vbo;
   glGenBuffers(1, &vbo);
@@ -292,7 +342,9 @@ static uint8_t* g_readback = nullptr;
 
 void gles_render_event_frame(SimGlue& glue, bool jitter, uint8_t* rgb, int w, int h) {
   const mjModel* m = glue.model();
-  const mjData* d = glue.data();
+  std::vector<float> pos, quat;
+  copy_poses(pos, quat);
+  if (pos.size() < (size_t)3 * m->nbody) return;  // no snapshot yet
   if (!g_fbo) {
     glGenFramebuffers(1, &g_fbo);
     glGenTextures(1, &g_fbo_tex);
@@ -318,17 +370,11 @@ void gles_render_event_frame(SimGlue& glue, bool jitter, uint8_t* rgb, int w, in
   float up[3] = {0, 1, 0};
   Mat4 view = Mat4::lookAt(eye, ctr, up);
   Mat4 proj = Mat4::perspective(78.f * (float)M_PI / 180.f, (float)w / h, 0.05f, 5.f);
-  Mat4 vp;
-  for (int r = 0; r < 4; ++r)
-    for (int c = 0; c < 4; ++c) {
-      float acc = 0;
-      for (int k = 0; k < 4; ++k) acc += proj.m[4*k+c] * view.m[4*r+k];
-      vp.m[4*r+c] = acc;
-    }
+  Mat4 vp = proj * view;  // same fixed column-major path as the view render
   glUniformMatrix4fv(g_uMVP, 1, GL_FALSE, vp.m);
   for (int g = 0; g < m->ngeom; ++g) {
     if (m->geom_type[g] == mjGEOM_PLANE) continue;
-    draw_geom(m, d, g, 1.f);
+    draw_geom(m, pos, quat, g, 1.f);
   }
   glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, g_readback);
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
