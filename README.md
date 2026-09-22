@@ -7,7 +7,7 @@ Farben zu sortieren und in Zonen zu stapeln — **ohne Internet, ohne Cloud, mit
 100-Hz-Taktung und kontinuierlicher Online-Adaption**.
 
 **Repo:** https://github.com/KilllerBoss/panda-cube-sorter
-**APK-Download:** [Release v1.0.1](https://github.com/KilllerBoss/panda-cube-sorter/releases/download/v1.0.1/PandaCubeSorter-v1.0.1-release.apk)
+**APK-Download:** [Release v1.1.0](https://github.com/KilllerBoss/panda-cube-sorter/releases/download/v1.1.0/PandaCubeSorter-v1.1.0-release.apk)
 
 ---
 
@@ -27,7 +27,7 @@ Farben zu sortieren und in Zonen zu stapeln — **ohne Internet, ohne Cloud, mit
 | NativeActivity + OpenGL-ES-3.0-Rendering + HUD | implementiert | `app/src/main/cpp/` |
 | Trainings-Pipeline (Collect → NMF → KAN → Heads → Export) | implementiert, lauffähig | `toolchain/` |
 | Desktop-Harness (Benchmarks + Erfolgsquote, ohne Android) | implementiert | `desktop/`, `scripts/run_harness.sh` |
-| Signierte Release-APK (minSdk 31, arm64-v8a, offline) | **erzeugt & publiziert** | `apk/PandaCubeSorter-v1.0.1-release.apk` |
+| Signierte Release-APK (minSdk 31, arm64-v8a, offline) | **erzeugt & publiziert** | `apk/PandaCubeSorter-v1.1.0-release.apk` |
 
 ## Änderungen in v1.0.1 — Black-Screen-Fix
 
@@ -87,6 +87,52 @@ Zusätzlich:
 Bei hartnäckigem E7: `adb logcat -d -s panda-sorter > pcs_log.txt` schicken — der Report
 enthält dann den exakten Treiber/Fehlerpunkt.
 
+## Änderungen in v1.1.0 — Die Szene ist sichtbar + Bedien-UI (Buttons, Roboter-Kamera)
+
+**Feldbericht v1.0.3:** weiterhin nur Grautöne — keine Szene, kein Arm, kein HUD-Balken.
+Der entscheidende Durchbruch: der Renderer-Code wurde erstmals **offscreen auf dem Desktop
+mit dem exakten GLES-Pfad** ausgeführt (Mesa/llvmpipe, Pixel-Zensus statt Augenmaß).
+Damit ließ sich der Grau-Bildschirm lokal reproduzieren (100 % Hintergrundpixel,
+GL_INVALID_OPERATION) und systematisch abstellen:
+
+1. **Hauptfehler — `uModel` fehlte in der Vertex-Position:** der Shader rechnete
+   `gl_Position = uMVP * vec4(aPos,1.0)` — die Modell-Transformation wurde ignoriert.
+   Jede Geometrie wurde als **grenzenloser Einheitswürfel über den ganzen Bildschirm**
+   gezeichnet (der letzte gewinnt) → das Ergebnis: ein einzelner grauer Riesenquader.
+   Fix: `gl_Position = uMVP * uModel * vec4(aPos,1.0)`.
+2. **Shader-Compile/Link wurde nie geprüft:** `make_program` loggt jetzt Compile-/Link-
+   Status inkl. Info-Log (auf dem Desktop war z. B. `precision mediump float` der
+   Killer — ES-Syntax, die Desktop-GLSL ablehnt; auf dem Gerät verstummte der Renderer
+   stattdessen mit dem Fehler oben).
+3. **Stiller Früh-Ausstieg entfernt:** ohne Pose-Snapshot kehrte der View-Render zurück,
+   **ohne auch nur Clear oder HUD zu zeichnen** → undefinierter Pufferinhalt = "Grautöne".
+   Jetzt wird immer gezeichnet; der Loop publiziert den Snapshot zusätzlich direkt nach
+   dem Episode-Reset (Szene ab dem ersten Frame sichtbar).
+4. **Zonen sichtbar:** der alte Filter (nur `contype != 0`) versteckte die farbigen
+   Sortierzonen; jetzt werden alle nicht-transparenten Geoms gezeichnet. Neu: auch
+   Kugel-Geoms werden gerendert (eigene VBO).
+
+**Neu in v1.1.0 — Bedien-UI (unten am Bildschirmrand):**
+
+| Button | Funktion |
+|---|---|
+| **START / PAUSE** | 100-Hz-Pipeline anhalten/fortsetzen (grüner Unterstrich = läuft) |
+| **STOP** | Arm einfrieren (Ziel = Ist-Pose, Greifer öffnet); erneut tippen = frei |
+| **FINE** | LoRA-Finetune-Burst (32 Lyapunov-Updates auf den letzten Tracking-Fehler) |
+| **NEU** | neue Episode: 4-8 Würfel neu auswürfeln |
+
+**Neu — Roboter-Kamera als Bild-in-Bild (oben rechts):** das Live-Bild der Event-Kamera
+(dieselbe 96×72-Ansicht, die die Perzeption speist) wird mit weißem Rahmen eingeblendet —
+man sieht jederzeit, **was der Roboter sieht**.
+
+**Neu — HUD-Diagnose ohne adb (oben links):** `SORTIERT n/m GESTAPELT k` (Fortschritt),
+`ZYK n B0-3 G0+x AKTIV/PAUSE/HALT/FINE` (Zykel, EGL-Bindung, GL-Fehlerzähler, Modus).
+Zusätzlich die Budget-Leiste oben (Rot = 10-ms-Budget überschritten).
+
+**Desktop-Verifikation (neuer Test, `scripts/dgl/` im Workspace):** 200 reale Pipeline-
+Zyklen inkl. Event-Frame, Step, Publish, PiP-Feed: **0,54 ms/Zyklus** (Budget 10 ms),
+GL-Fehler 0, Buttons-Hit-Test korrekt, Würfel/Zonen/Arm/Greifer sichtbar.
+
 ## Änderungen in v1.0.3 — Render-Fix (graue Szene + Dreiecks-Chaos)
 
 **Feldbericht v1.0.2:** App läuft (E7 weg!), aber die Szene zeigt nur Grau, sporadisch
@@ -117,14 +163,17 @@ Render-Bugs im GLES-Renderer (er wurde auf dem Gerät zum ersten Mal sichtbar au
 
 ```bash
 # 1) APK herunterladen (Release-Seite) oder aus apk/ nehmen
-adb install -r apk/PandaCubeSorter-v1.0.3-release.apk
+adb install -r apk/PandaCubeSorter-v1.1.0-release.apk
 
 # 2) App starten ("Panda Cube Sorter"), Flugzeugmodus an — sie läuft autark
 
-# 3) Bedienung (minimales UI):
-#    - Tippen          → neue Episode: 4-8 Würfel werden zufällig platziert
-#    - Statusleiste    → Breite = genutzter Anteil des 10-ms-Zyklusbudgets
-#    - adb logcat      → Zykluszeiten, Phasen, Ereignisse
+# 3) Bedienung (Buttons unten, Roboter-Kamera oben rechts, HUD-Diagnose oben links):
+#    - START/PAUSE     → 100-Hz-Pipeline anhalten/fortsetzen
+#    - STOP            → Arm einfrieren (noch mal tippen = frei)
+#    - FINE            → LoRA-Finetune-Burst auslösen
+#    - NEU             → neue Episode: 4-8 Würfel neu auswürfeln
+#    - Budget-Leiste   → genutzter Anteil des 10-ms-Zyklusbudgets
+#    - adb logcat -s panda-sorter  → Details
 
 # 4) Benchmarks auf dem Gerät (siehe docs/BENCHMARKS.md):
 adb shell /data/local/tmp/warmup_bench   # Warmup 1000 Steps + Timing

@@ -184,6 +184,10 @@ void Controller::cycle(const ControllerInput& in, ControllerOutput& out) {
   float e[kDof];
   for (int j = 0; j < kDof; ++j) e[j] = out.q_des[j] - in.q[j];
   lora.update(e, out.mlp.h1, lora_st, w);
+  // keep the sample for the FINETUNE button burst
+  for (int j = 0; j < kDof; ++j) last_e_[j] = e[j];
+  for (int h = 0; h < kMlpHidden; ++h) last_h1_[h] = out.mlp.h1[h];
+  has_sample_ = true;
   auto t8 = clk::now();
 
   // ---------- stats ----------
@@ -200,6 +204,15 @@ void Controller::cycle(const ControllerInput& in, ControllerOutput& out) {
   out.stats.n_events = out.events.n_events;
   out.stats.n_spikes = out.snn.n_spikes;
   out.stats.cycles++;
+}
+
+// FINETUNE button: replay the Lyapunov update on the last stored tracking
+// error a few times — a cheap on-device burst that tightens the adapter
+// around the currently observed error without any extra data.
+void Controller::finetune(int iters) {
+  if (!has_sample_) return;
+  const int n = iters > 0 ? iters : 16;
+  for (int i = 0; i < n; ++i) lora.update(last_e_, last_h1_, lora_st, w);
 }
 
 }  // namespace pcs

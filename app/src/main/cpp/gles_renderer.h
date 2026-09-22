@@ -35,5 +35,42 @@ void gles_publish_poses(const mjModel* m, const mjData* d);
 // status / error screen: code 0 = loading (amber), >=2 = error (red + code)
 // renders "L0" or "E<n>" with a 3x5 pixel font, works without gles_init.
 // `sub` (optional) draws a smaller hex line below (e.g. "0X3009") — glyphs
-// available: 0-9, A-F, E, L, X.
+// available: 0-9, A-Z, and a few punctuation marks.
 void gles_render_status(int code, int win_w, int win_h, const char* sub = nullptr);
+
+// ---------------- v1.1.0 UI ----------------
+
+// on-screen buttons (bottom bar), drawn by the HUD, hit-tested by the
+// input thread via gles_hit_button(); state flows through lock-free flags.
+enum PcsButton {
+  BTN_START = 0,   // toggle run/pause of the 100 Hz pipeline
+  BTN_STOP,        // freeze the arm where it is, open the gripper
+  BTN_FINE,        // LoRA finetune burst on the current tracking error
+  BTN_NEW,         // new episode: re-randomize 4-8 cubes
+  BTN_COUNT
+};
+
+// window-coords touch point -> button id, or -1 if none hit
+int gles_hit_button(float x, float y);
+
+// UI flags written by the input thread, consumed (and cleared) by the loop
+struct PcsUiState {
+  bool toggle_run = false;  // START/PAUSE was pressed
+  bool stop = false;        // STOP pressed
+  bool fine = false;        // FINETUNE pressed
+  bool new_episode = false; // NEW pressed
+};
+PcsUiState gles_take_ui();
+// input thread -> UI flags (OR-accumulated until the loop consumes them)
+void gles_push_ui(const PcsUiState& s);
+
+// loop thread -> renderer: latest perception frame for the picture-in-picture
+// robot-camera view (copied under a light mutex, uploaded by the view thread)
+void gles_push_pip(const uint8_t* rgb, int w, int h);
+
+// loop thread -> HUD diagnostics line (visible WITHOUT adb)
+void gles_set_diag(int bind, int gl_errs, long cycles, int sorted, int total,
+                   int stacked, bool paused, bool halted, bool finetuning);
+
+// number of view frames that ended with a GL error (shown as G<n> in HUD)
+int gles_gl_errs();

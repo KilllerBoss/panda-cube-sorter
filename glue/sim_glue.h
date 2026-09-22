@@ -23,6 +23,11 @@ class SimGlue {
   void reset_episode(uint64_t seed);          // random cubes + home pose
   void randomize_cubes(uint64_t seed);        // cubes only (stress benchmark)
 
+  // STOP button: freeze the arm at the current configuration, open gripper.
+  // While halted, step_cycle keeps physics alive but no longer moves the arm.
+  void set_halt(bool h) { halted_ = h; }
+  bool halted() const { return halted_; }
+
   // one 10 ms control cycle: mj_step x substeps, then perception+control,
   // then torque write to ctrl. `frame` = event-camera RGB input.
   void step_cycle(Controller& c, ControllerOutput& out,
@@ -77,6 +82,7 @@ class SimGlue {
   bool  grasped_ = false, contact_l_ = false, contact_r_ = false;
   int   sorted_ = 0, stacked_ = 0;
   int   substeps_ = 5;
+  bool  halted_ = false;
 };
 
 }  // namespace pcs

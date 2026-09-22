@@ -53,6 +53,10 @@ class Controller {
 
   void cycle(const ControllerInput& in, ControllerOutput& out);
 
+  // Finetune button: run a short LoRA burst on the last stored tracking
+  // error (same analytic Lyapunov update, elevated iteration count).
+  void finetune(int iters);
+
   Weights w;
   EventCamera cam;
   AlifLsnn snn;
@@ -63,6 +67,12 @@ class Controller {
   TaskLayer task;
   LoraState lora_st;
   float pulse_bins_[576] = {0};   // latched refresh-pulse event snapshot
+
+ private:
+  // last cycle's adaptation sample (kept for the finetune burst)
+  float last_e_[kDof] = {0};
+  float last_h1_[kMlpHidden] = {0};
+  bool has_sample_ = false;
 };
 
 }  // namespace pcs

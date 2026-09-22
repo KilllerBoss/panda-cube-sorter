@@ -7,12 +7,18 @@ android {
     compileSdk = 34
     ndkVersion = "27.1.12297006"
 
+    // pure-NDK app: skip the lintVital pass (it is slow, disk-hungry and
+    // irrelevant here — the app ships no Java/Kotlin logic to lint)
+    lint {
+        checkReleaseBuilds = false
+    }
+
     defaultConfig {
         applicationId = "dev.pandasorter"
         minSdk = 31
         targetSdk = 34
-        versionCode = 4
-        versionName = "1.0.3"
+        versionCode = 5
+        versionName = "1.1.0"
         ndk { abiFilters += listOf("arm64-v8a") }
         externalNativeBuild {
             cmake { arguments += listOf("-DANDROID_STL=c++_shared") }

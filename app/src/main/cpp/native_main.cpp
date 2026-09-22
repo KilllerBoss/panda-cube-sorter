@@ -71,6 +71,8 @@ static std::atomic<bool> g_new_episode{false};
 static std::atomic<bool> g_has_surface{false};
 static std::atomic<int> g_err{ST_LOADING};     // 0 = loading, 1 = running, >=2 = error
 static std::atomic<bool> g_gl_ready{false};    // gles_init done (loop thread)
+static std::atomic<bool> g_paused{false};      // START/PAUSE button
+static std::atomic<int> g_fine_until{0};       // show "FINE" in the HUD until cycle N
 
 static ANativeWindow* g_window = nullptr;
 static std::mutex g_window_mutex;
@@ -81,6 +83,20 @@ static std::vector<uint8_t> g_frame(kEvW * kEvH * 3);
 
 static AInputQueue* g_queue = nullptr;
 static int looper_callback(int fd, int events, void* data);
+
+// UI flags -> renderer (button hits from the input thread)
+static void handle_touch_down(float x, float y) {
+  const int btn = gles_hit_button(x, y);
+  if (btn < 0) return;  // touches on the scene do nothing (no accidental resets)
+  PcsUiState s;
+  switch (btn) {
+    case BTN_START: s.toggle_run = true; break;
+    case BTN_STOP:  s.stop = true; break;
+    case BTN_FINE:  s.fine = true; break;
+    case BTN_NEW:   s.new_episode = true; break;
+  }
+  gles_push_ui(s);
+}
 
 // ------------------------ diagnostics ------------------------
 static ANativeActivity* g_activity = nullptr;
@@ -374,6 +390,7 @@ static void execution_loop() {
   ControllerOutput out;
   uint64_t episode = 1;
   g_glue.reset_episode(1000 + episode * 7919);
+  gles_publish_poses(g_glue.model(), g_glue.data());  // view shows the scene immediately
   g_ctrl.reset();
   g_err = ST_RUNNING;
 
@@ -385,21 +402,49 @@ static void execution_loop() {
   while (g_running && g_has_surface) {
     next += period;
 
+    // ---- UI buttons (START/PAUSE, STOP, FINE, NEW) ----
+    const PcsUiState ui = gles_take_ui();
+    if (ui.toggle_run) {
+      const bool now = !g_paused.load();
+      g_paused = now;
+      if (!now) g_glue.set_halt(false);  // START also releases a STOP
+      LOGI("button: %s", now ? "PAUSE" : "START");
+    }
+    if (ui.stop) {
+      g_glue.set_halt(!g_glue.halted());  // STOP toggles freeze
+      LOGI("button: STOP -> %s", g_glue.halted() ? "halt" : "run");
+    }
+    if (ui.fine) {
+      g_ctrl.finetune(32);
+      g_fine_until = (int)cyc + 150;  // show "FINE" for ~1.5 s
+      LOGI("button: FINETUNE burst");
+    }
+    if (ui.new_episode) g_new_episode = true;
+
     if (g_new_episode.exchange(false)) {
       ++episode;
       g_glue.reset_episode(1000 + episode * 7919);
+      gles_publish_poses(g_glue.model(), g_glue.data());
       g_ctrl.reset();
+      g_glue.set_halt(false);
       LOGI("new episode %llu", (unsigned long long)episode);
     }
 
-    // ---- physics + perception + control (the whole pipeline) ----
-    // GLES event-camera pass on THIS thread (context owner, single GL thread)
-    gles_render_event_frame(g_glue, refresh, g_frame.data(), kEvW, kEvH);
-    g_glue.step_cycle(g_ctrl, out, g_frame.data(), kEvW, kEvH, refresh);
-    gles_publish_poses(g_glue.model(), g_glue.data());  // stable snapshot for the view thread
-    refresh = (cyc % 50) == 49;  // micro-jitter pulse every 0.5 s
-    out_stats_set(out.stats);
-    out_task_set(out.task);
+    if (!g_paused.load()) {
+      // ---- physics + perception + control (the whole pipeline) ----
+      // GLES event-camera pass on THIS thread (context owner, single GL thread)
+      gles_render_event_frame(g_glue, refresh, g_frame.data(), kEvW, kEvH);
+      gles_push_pip(g_frame.data(), kEvW, kEvH);  // robot-camera PiP feed
+      g_glue.step_cycle(g_ctrl, out, g_frame.data(), kEvW, kEvH, refresh);
+      gles_publish_poses(g_glue.model(), g_glue.data());  // stable snapshot for the view thread
+      refresh = (cyc % 50) == 49;  // micro-jitter pulse every 0.5 s
+      out_stats_set(out.stats);
+      out_task_set(out.task);
+    }
+    gles_set_diag((int)g_loop_bind, gles_gl_errs(), (long)cyc,
+                  g_glue.sorted_count(), g_glue.total_cubes(),
+                  g_glue.stacked_count(), g_paused.load(), g_glue.halted(),
+                  (int)cyc < g_fine_until.load());
 
     // ---- pacing ----
     auto now = std::chrono::steady_clock::now();
@@ -471,7 +516,7 @@ static int looper_callback(int fd, int events, void* data) {
   while (AInputQueue_getEvent(queue, &ev) >= 0) {
     if (AInputEvent_getType(ev) == AINPUT_EVENT_TYPE_MOTION &&
         AMotionEvent_getAction(ev) == AMOTION_EVENT_ACTION_DOWN) {
-      g_new_episode = true;
+      handle_touch_down(AMotionEvent_getX(ev, 0), AMotionEvent_getY(ev, 0));
     }
     AInputQueue_finishEvent(queue, ev, 1);
   }

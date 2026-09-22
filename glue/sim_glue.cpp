@@ -224,7 +224,11 @@ void SimGlue::step_cycle(Controller& c, ControllerOutput& out,
   // ---- IK: closed-form fold solution of the cartesian target ----
   // (exact for our top-down grasp family; recomputed every cycle -> drift-free)
   const float* tgt = out.task.tcp_target;
-  if (out.task.joint_hold) {
+  if (halted_) {
+    // STOP: hold the current configuration (target = measured pose)
+    for (int j = 0; j < 7; ++j) q_goal_[j] = cin.q[j];
+    d_->ctrl[act_grip_] = kGripOpen;
+  } else if (out.task.joint_hold) {
     for (int j = 0; j < 7; ++j) q_goal_[j] = out.task.q_goal[j];
   } else {
     const float rr = sqrtf(tgt[0] * tgt[0] + tgt[1] * tgt[1]);
