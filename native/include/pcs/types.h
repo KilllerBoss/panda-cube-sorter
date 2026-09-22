@@ -16,12 +16,13 @@ constexpr int kNumCubes   = 8;    // active cubes in the sorting scene
 constexpr int kNumColors  = 4;
 constexpr int kNumPhases  = 8;    // task state machine phases
 constexpr int kMlpIn      = 24;   // [dq_goal(7) q_start(7) s(1) grip(1) phase(8)]
-constexpr int kMlpHidden  = 16;
+constexpr int kMlpHidden  = 8;    // hidden width of the compiled KAN
 constexpr int kMlpOut     = 8;    // mixture weights over prototypes (softmax)
 constexpr int kLsnnN      = 128;  // ALIF neurons
 constexpr int kLsnnIn     = 576;  // 12x8 grid x (2 polarity + 4 hue) = 576 bins
 constexpr int kLoraRank   = 4;    // LoRA rank on MLP output layer
 constexpr int kDecOut     = 48;   // decoder: x_off(8) y(8) color_logits(8x4=32)
+constexpr int kDecIn      = kEmbDim + kLsnnIn;  // [embedding ; event bins] head input
 constexpr int kHinges1    = 4;    // ReLU hinges per univariate spline (K=5 knots)
 constexpr int kL1Feats    = kMlpIn + kMlpIn * kHinges1;        // 24 + 96 = 120
 constexpr int kL2Feats    = kMlpHidden + kMlpHidden * kHinges1; // 16 + 64 = 80

@@ -35,6 +35,9 @@ void Controller::cycle(const ControllerInput& in, ControllerOutput& out) {
 
   // ---------- Phase 2: perception ----------
   cam.process(in.frame_rgb, in.frame_w, in.frame_h, in.refresh_pulse, out.events);
+  if (in.refresh_pulse) {
+    memcpy(pulse_bins_, out.events.bins, sizeof(pulse_bins_));  // latch snapshot
+  }
   auto t1 = clk::now();
 
   snn.step(out.events.bins, w, out.snn);
@@ -43,8 +46,8 @@ void Controller::cycle(const ControllerInput& in, ControllerOutput& out) {
   coder.step(out.events.bins, out.snn, w, out.emb, out.free_energy);
   auto t3 = clk::now();
 
-  // ---------- decode cube map ----------
-  TaskInput tin;
+  TaskInput tin;   // filled by the detection head below + task inputs here
+  // ---------- task input ----------
   tin.dt = in.dt;
   for (int j = 0; j < kDof; ++j) tin.q[j] = in.q[j];
   tin.grip = in.grip;
@@ -54,26 +57,88 @@ void Controller::cycle(const ControllerInput& in, ControllerOutput& out) {
   tin.contact_l = in.contact_l;
   tin.contact_r = in.contact_r;
   tin.n_cubes = kNumCubes;
-  float dec[kDecOut];
-  for (int o = 0; o < kDecOut; ++o) {
-    float acc = w.dec_b[o];
-    for (int d = 0; d < kEmbDim; ++d) acc += out.emb[d] * w.dec_w[(size_t)d * kDecOut + o];
-    dec[o] = acc;
-  }
-  for (int c = 0; c < kNumCubes; ++c) {
-    CubeSlot& s = tin.cubes[c];
-    s.x = 0.38f + dec[c];                       // x offset around scene center
-    s.y = dec[kNumCubes + c];
-    int best = 0;
-    float bv = dec[2 * kNumCubes + c];
-    for (int k = 1; k < kNumColors; ++k) {
-      const float v = dec[2 * kNumCubes + k * kNumCubes + c];
-      if (v > bv) { bv = v; best = k; }
+  {
+    // ---- analytic detection head on the latched pulse frame ----
+    // 12x8 cell grid; hue channels at cell*6 + {2..5} = r,g,b,y.
+    // Camera affine (cam_event at (0.42,0,1.05), fovy 78, depth ~0.75 m):
+    //   world_x = 0.42 + (u-0.5)*1.62 ; world_y = (0.5-v)*1.215
+    float act[4][kBinCols * kBinRows];
+    for (int k = 0; k < 4; ++k)
+      for (int cell = 0; cell < kBinCols * kBinRows; ++cell)
+        act[k][cell] = pulse_bins_[(size_t)cell * kBinsPerCell + 2 + k];
+    // mask the sorting zones (same colors as the cubes!) — fixed positions
+    static const float kZoneXY[4][2] = {{0.36f,-0.26f},{0.36f,0.26f},{0.50f,-0.12f},{0.50f,0.12f}};
+    bool masked[kBinCols * kBinRows];
+    for (int cell = 0; cell < kBinCols * kBinRows; ++cell) {
+      const int r = cell / kBinCols, c = cell % kBinCols;
+      const float wx = 0.42f + (((float)c + 0.5f) / kBinCols - 0.5f) * 1.62f;
+      const float wy = (0.5f - ((float)r + 0.5f) / kBinRows) * 1.215f;
+      masked[cell] = false;
+      for (int z = 0; z < 4; ++z) {
+        const float dx = wx - kZoneXY[z][0], dy = wy - kZoneXY[z][1];
+        if (dx * dx + dy * dy < 0.145f * 0.145f) { masked[cell] = true; break; }
+      }
     }
-    s.color = best;
-    s.score = bv;                               // max color logit = confidence
-    for (int k = 0; k < kNumColors; ++k)
-      s.color_logits[k] = dec[2 * kNumCubes + k * kNumCubes + c];
+    float sm[4][kBinCols * kBinRows];
+    for (int k = 0; k < 4; ++k)
+      for (int r = 0; r < kBinRows; ++r)
+        for (int c = 0; c < kBinCols; ++c) {
+          float acc = 0; int wn = 0;
+          for (int dr = -1; dr <= 1; ++dr)
+            for (int dc = -1; dc <= 1; ++dc) {
+              const int rr = r + dr, cc = c + dc;
+              if (rr < 0 || rr >= kBinRows || cc < 0 || cc >= kBinCols) continue;
+              acc += act[k][rr * kBinCols + cc]; wn++;
+            }
+          sm[k][r * kBinCols + c] = masked[r * kBinCols + c] ? 0.f : acc / (float)wn;
+        }
+    int slot = 0;
+    for (int k = 0; k < kNumColors && slot < kNumCubes; ++k) {
+      for (int peak = 0; peak < 2 && slot < kNumCubes; ++peak) {
+        int best = -1; float bv = 0.03f;
+        for (int cell = 0; cell < kBinCols * kBinRows; ++cell) {
+          if (sm[k][cell] <= bv) continue;
+          const int r = cell / kBinCols, c = cell % kBinCols;
+          bool is_max = true;
+          for (int dr = -1; dr <= 1 && is_max; ++dr)
+            for (int dc = -1; dc <= 1 && is_max; ++dc) {
+              const int rr = r + dr, cc = c + dc;
+              if (rr < 0 || rr >= kBinRows || cc < 0 || cc >= kBinCols) continue;
+              if (sm[k][rr * kBinCols + cc] > sm[k][cell] + 1e-6f) is_max = false;
+            }
+          if (is_max) { bv = sm[k][cell]; best = cell; }
+        }
+        if (best < 0) break;
+        sm[k][best] = 0.f;
+        const int r0 = best / kBinCols, c0 = best % kBinCols;
+        float wsum = 0, uacc = 0, vacc = 0;
+        for (int dr = -1; dr <= 1; ++dr)
+          for (int dc = -1; dc <= 1; ++dc) {
+            const int rr = r0 + dr, cc = c0 + dc;
+            if (rr < 0 || rr >= kBinRows || cc < 0 || cc >= kBinCols) continue;
+            const float w = sm[k][best] + act[k][rr * kBinCols + cc] * 0.5f;
+            wsum += w;
+            uacc += w * ((float)cc + 0.5f) / (float)kBinCols;
+            vacc += w * ((float)rr + 0.5f) / (float)kBinRows;
+          }
+        if (wsum <= 0.f) continue;
+        const float u = uacc / wsum, v = vacc / wsum;
+        CubeSlot& sl = tin.cubes[slot];
+        sl.x = 0.42f + (u - 0.5f) * 1.62f;
+        sl.y = (0.5f - v) * 1.215f;
+        sl.color = k;
+        for (int kk = 0; kk < kNumColors; ++kk) sl.color_logits[kk] = (kk == k) ? 1.5f : -1.f;
+        sl.score = bv;
+        out.dbg_slots[slot] = sl;
+        slot++;
+      }
+    }
+    for (; slot < kNumCubes; ++slot) {
+      CubeSlot& sl = tin.cubes[slot];
+      sl.x = 0.38f; sl.y = 0.f; sl.color = 0; sl.score = -10.f;
+      for (int kk = 0; kk < kNumColors; ++kk) sl.color_logits[kk] = -1.f;
+      out.dbg_slots[slot] = sl;
+    }
   }
   auto t4 = clk::now();
 

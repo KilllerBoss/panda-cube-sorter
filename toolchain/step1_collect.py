@@ -93,6 +93,7 @@ def main():
     coder = PredCoder()
     st = LsnnState()
     bins = np.zeros(NUM_BINS, np.float32)
+    pbins = np.zeros(NUM_BINS, np.float32)   # latched last pulse snapshot
     emb = np.zeros(32, np.float32)
 
     # ids
@@ -110,7 +111,8 @@ def main():
 
     rows = {k: [] for k in
             ["phase", "s", "q_start", "q_goal", "q_des", "q", "qd", "grip",
-             "grip_target", "emb", "cube_xy", "cube_color", "grasped", "q_add_base"]}
+             "grip_target", "emb", "cube_xy", "cube_color", "grasped", "q_add_base",
+             "pbins"]}
     q_goal = C.HOME_Q.copy()
     q_track = C.HOME_Q.copy()   # rate-limited PD setpoint
     q_des_prev = C.HOME_Q.copy()
@@ -155,6 +157,7 @@ def main():
         reset_episode(1000 + ep * 7919)
         task = C.ExpertTask(zone_pos)
         cam = EventCamera()  # fresh reference frame per episode
+        pbins[:] = 0
         prev_phase = C.PH_RESET
         q_start_cur = C.HOME_Q.copy()
         for cyc in range(14000):
@@ -215,6 +218,9 @@ def main():
             rows["grip"].append(float(data.qpos[model.jnt_qposadr[7]]))
             rows["grip_target"].append(grip_t)
             rows["emb"].append(emb.copy())
+            if pulse:
+                pbins[:] = bins            # latch the refresh-pulse snapshot
+            rows["pbins"].append(pbins.copy())
             rows["cube_xy"].append(cube_xy.copy())
             rows["cube_color"].append(cube_color.copy())
             rows["grasped"].append(grasped)

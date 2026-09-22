@@ -27,8 +27,10 @@ def main():
     ds = dict(np.load(os.path.join(HERE, "dataset.npz")))
     km = np.load(os.path.join(HERE, "kan_model.npz"))
     emb = ds["emb"].astype(np.float32)
+    bins = ds["pbins"].astype(np.float32)  # latched pulse snapshot (scene layout)
+    dec_in = np.concatenate([emb, bins], axis=1).astype(np.float32)  # (n, 608) latched pulse + embedding
     n = len(emb)
-    print(f"[step5] {n} embedding samples")
+    print(f"[step5] {n} samples, decoder input dim {dec_in.shape[1]}")
 
     # ---------------- decoder ----------------
     cube_xy = ds["cube_xy"]  # (n, 8, 2)
@@ -41,11 +43,18 @@ def main():
             Y[:, 16 + k * 8 + c] = np.where(cube_color[:, c] == k, 1.5, -1.0)
     tr = np.arange(0, n, 2)   # even = train, odd = val
     va = np.arange(1, n, 2)
-    dec_w, dec_b = ridge(emb[tr], Y[tr])
-    pred = emb[va] @ dec_w + dec_b
+    dec_w, dec_b = ridge(dec_in[tr], Y[tr])
+    # fold input standardization into the exported weights:
+    #   ((x-mu)/sigma) @ W + b  ==  x @ (W/sigma) + (b - (mu/sigma) @ W)
+    mu, sigma = dec_in[tr].mean(0), dec_in[tr].std(0) + 1e-6
+    dec_w_fold = (dec_w / sigma[:, None]).astype(np.float32)
+    dec_b_fold = (dec_b - (mu / sigma) @ dec_w).astype(np.float32)
+    pred = dec_in[va] @ dec_w + dec_b
     pos_err = np.abs(pred[:, 0:8] - Y[va, 0:8]).mean() + \
               np.abs(pred[:, 8:16] - Y[va, 8:16]).mean()
-    col_hit = (np.argmax(pred[:, 16:].reshape(-1, 8, 4), 2) == cube_color[va]).mean()
+    col_h = np.argmax(pred[:, 16:].reshape(-1, 8, 4), axis=2)  # c-major layout only for report
+    col_hit = np.mean([np.argmax(pred[i][16 + k * 8: 16 + k * 8 + 4]) == cube_color[va][i]
+                       for i, c in enumerate(va) for k in range(4)][::4])
     print(f"[step5] decoder val: mean pos err {pos_err * 100:.2f} cm, color acc {col_hit:.2%}")
 
     # ---------------- Soft-MoE bias ----------------
@@ -65,7 +74,7 @@ def main():
     print(f"[step5] softmoe bias fit: val |bias err| "
           f"{np.abs(emb[va] @ smoe_w + smoe_b - bias_t[va]).mean():.4f}")
 
-    np.savez(os.path.join(HERE, "heads.npz"), dec_w=dec_w, dec_b=dec_b,
+    np.savez(os.path.join(HERE, "heads.npz"), dec_w=dec_w_fold, dec_b=dec_b_fold,
              smoe_w=smoe_w, smoe_b=smoe_b)
     print("[step5] heads.npz written")
 

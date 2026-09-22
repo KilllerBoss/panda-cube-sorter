@@ -1,6 +1,7 @@
 // pcs/task_layer.cpp — sorting/stacking state machine
 #include "pcs/task_layer.h"
 #include <cstdlib>
+#include <cstdio>
 #include <algorithm>
 
 namespace pcs {
@@ -11,7 +12,7 @@ static constexpr float kGraspZ   = 0.29f;    // pads beside cube mid-height, the
 static constexpr float kPlaceZ0  = 0.283f;   // cube bottom touches table/stack
 static constexpr float kTransZ   = 0.42f;
 static constexpr float kStackDz  = 0.052f;   // cube height + clearance
-static constexpr float kSlotScoreMin = 0.02f;
+static constexpr float kSlotScoreMin = -10.f;  // relative selection only
 
 void TaskLayer::reset() {
   next_color_ = 0; in_flight_ = false; flight_slot_ = -1; phase_t_ = 0.f;
@@ -36,6 +37,12 @@ static float phase_duration(int p) {
 }
 
 void TaskLayer::start_phase(int p, const TaskInput& in, TaskOutput& out) {
+  if (getenv("PCS_TRACE")) {
+    fprintf(stderr, "[task] %s -> %s slot=%d grasped=%d grab=(%.3f,%.3f) tcp=(%.3f,%.3f,%.3f) q=(%.2f %.2f %.2f %.2f %.2f %.2f %.2f)\n",
+            kPhaseName[phase_], kPhaseName[p], cur_slot_, (int)in.grasped,
+            grab_xy_[0], grab_xy_[1], in.tcp_actual[0], in.tcp_actual[1], in.tcp_actual[2],
+            in.q[0], in.q[1], in.q[2], in.q[3], in.q[4], in.q[5], in.q[6]);
+  }
   prev_phase_ = phase_;
   phase_ = p;
   phase_t_ = 0.f;
@@ -46,7 +53,7 @@ void TaskLayer::start_phase(int p, const TaskInput& in, TaskOutput& out) {
 
 void TaskLayer::pick_next_slot(const TaskInput& in) {
   // highest-scoring live slot of the color we are currently collecting
-  int best = -1; float best_sc = kSlotScoreMin;
+  int best = -1; float best_sc = kSlotScoreMin - 1.f;
   for (int round = 0; round < 2 && best < 0; ++round) {
     for (int i = 0; i < in.n_cubes; ++i) {
       if (slot_dead_[i]) continue;

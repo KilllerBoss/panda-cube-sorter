@@ -30,7 +30,7 @@ struct Weights {
   std::vector<float> hinge_t1;       // kMlpIn     x kHinges1 (knots, ascending)
   std::vector<float> hinge_t2;       // kMlpHidden x kHinges1
   // ---- decoder: embedding -> cube slots (x,y,color logits) ----
-  std::vector<float> dec_w, dec_b;   // kEmbDim x kDecOut, kDecOut
+  std::vector<float> dec_w, dec_b;   // kDecIn x kDecOut, kDecOut
   // ---- LoRA init (usually zeros) ----
   std::vector<float> lora_a, lora_b; // kMlpHidden x kLoraRank, kLoraRank x kMlpOut
   // ---- input/output scaling ----

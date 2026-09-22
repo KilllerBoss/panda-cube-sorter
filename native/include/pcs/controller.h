@@ -37,6 +37,7 @@ struct ControllerOutput {
   TaskOutput task;            // includes counters for HUD/eval
   // perception snapshot for HUD/debug
   float emb[kEmbDim];
+  CubeSlot dbg_slots[kNumCubes];   // decoded slots (debug/eval)
   EventFrame events;
   LsnnState snn;
   KanMlpState mlp;
@@ -61,6 +62,7 @@ class Controller {
   ProtoBank proto;
   TaskLayer task;
   LoraState lora_st;
+  float pulse_bins_[576] = {0};   // latched refresh-pulse event snapshot
 };
 
 }  // namespace pcs

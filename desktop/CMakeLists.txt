@@ -27,13 +27,17 @@ add_executable(pcs_harness
 )
 
 target_include_directories(pcs_harness PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
   ${CMAKE_CURRENT_SOURCE_DIR}/../native/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/../glue
   ${MUJOCO_DIR}/include
 )
 
 target_compile_options(pcs_harness PRIVATE -O3 -ffp-contract=fast)
 
-find_library(MUJOCO_LIB mujoco PATHS ${MUJOCO_DIR} PATH_SUFFIXES lib . NO_DEFAULT_PATH)
+find_library(MUJOCO_LIB NAMES mujoco libmujoco.so PATHS ${MUJOCO_DIR} PATH_SUFFIXES lib . NO_DEFAULT_PATH)
+if(NOT MUJOCO_LIB)
+  file(GLOB MUJOCO_LIB "${MUJOCO_DIR}/libmujoco.so*")
+  list(GET MUJOCO_LIB 0 MUJOCO_LIB)
+endif()
 target_link_libraries(pcs_harness PRIVATE ${MUJOCO_LIB})
 set_target_properties(pcs_harness PROPERTIES BUILD_RPATH "${MUJOCO_DIR}")

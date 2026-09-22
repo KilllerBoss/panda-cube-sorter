@@ -93,10 +93,12 @@ class CpuProjector {
   void draw_rect(SimGlue& g, uint8_t* rgb, float x0, float y0, float x1, float y1,
                  float z, const float col[3]) {
     float u0, v0, u1, v1, u2, v2, u3, v3, zz;
-    if (!project({x0, y0, z}, u0, v0, zz)) return;
-    if (!project({x1, y0, z}, u1, v1, zz)) return;
-    if (!project({x1, y1, z}, u2, v2, zz)) return;
-    if (!project({x0, y1, z}, u3, v3, zz)) return;
+    const float p0[3] = {x0, y0, z}, p1[3] = {x1, y0, z};
+    const float p2[3] = {x1, y1, z}, p3[3] = {x0, y1, z};
+    if (!project(p0, u0, v0, zz)) return;
+    if (!project(p1, u1, v1, zz)) return;
+    if (!project(p2, u2, v2, zz)) return;
+    if (!project(p3, u3, v3, zz)) return;
     const float umin = std::min({u0, u1, u2, u3}), umax = std::max({u0, u1, u2, u3});
     const float vmin = std::min({v0, v1, v2, v3}), vmax = std::max({v0, v1, v2, v3});
     fill_rect(rgb, umin, vmin, umax, vmax, col);
@@ -150,6 +152,7 @@ int main(int argc, char** argv) {
   }
   CpuProjector proj;
   proj.init(glue);
+  bool grasp_logged_ = false;
 
   ControllerOutput out;
   static uint8_t frame[kEvW * kEvH * 3];
@@ -170,6 +173,34 @@ int main(int argc, char** argv) {
         phys.add(out.stats.t_phys); pipe.add(out.stats.t_total);
         ev.add(out.stats.n_events); snn.add(out.stats.n_spikes);
         mlpt.add(out.stats.t_mlp); lora.add(out.stats.t_lora);
+        if (cyc == 100 && ep == 0 && getenv("PCS_DUMP")) {
+          FILE* f = fopen("/home/z/my-project/logs/pulse_frame.ppm", "wb");
+          fprintf(f, "P6\n%d %d\n255\n", kEvW, kEvH);
+          fwrite(frame, 1, kEvW * kEvH * 3, f);
+          fclose(f);
+          f = fopen("/home/z/my-project/logs/pulse_bins.txt", "w");
+          for (int b = 0; b < kNumBins; ++b)
+            if (out.events.bins[b] > 0.02f)
+              fprintf(f, "bin %d cell %d ch %d val %.3f\n", b, b / 6, b % 6, out.events.bins[b]);
+          fclose(f);
+          printf("  dumped pulse frame @c=100\n");
+        }
+        if (cyc % 2000 == 0 && ep == 0) {
+          printf("  c=%5d %s dec0=(%.2f,%.2f) truth0=(%.2f,%.2f) dec4=(%.2f,%.2f) truth4=(%.2f,%.2f)\n",
+                 cyc, kPhaseName[out.task.phase],
+                 out.dbg_slots[0].x, out.dbg_slots[0].y,
+                 glue.cube_pos(0)[0], glue.cube_pos(0)[1],
+                 out.dbg_slots[4].x, out.dbg_slots[4].y,
+                 glue.cube_pos(4)[0], glue.cube_pos(4)[1]);
+        }
+        if (getenv("PCS_TRACE") && out.task.phase == pcs::PH_GRASP && out.task.s > 0.95f
+            && !grasp_logged_) {
+          grasp_logged_ = true;
+          printf("  [grasp-end] slot=%d grab=(%.3f,%.3f) ctrl_grip=%.4f ncon=%d\n",
+                 out.task.in_flight, out.task.tcp_target[0], out.task.tcp_target[1],
+                 glue.data()->ctrl[7], glue.data()->ncon);
+        }
+        if (out.task.phase != pcs::PH_GRASP) grasp_logged_ = false;
         done = out.task.episode_done;
         ++cyc;
       }

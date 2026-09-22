@@ -26,7 +26,7 @@ def main():
     # fixed embedding projection [err(288) ; a(128)] -> 32
     w["emb_proj"] = (0.045 * rng.normal(0, 1, (NUM_BINS + LSNN_N, EMB_DIM))).astype(np.float32)
     # LoRA init = zeros (adapter grows purely online)
-    w["lora_a"] = np.zeros((16, 4), np.float32)
+    w["lora_a"] = np.zeros((8, 4), np.float32)
     w["lora_b"] = np.zeros((4, 8), np.float32)
     # META scalars: lambda_v, rho_a, beta_th, vth0, snn_eta, pred_eta, out_scale
     w["meta"] = np.array([0.85, 0.92, 0.35, 0.35, 0.0, 0.002, 1.0, 0.0], np.float32)

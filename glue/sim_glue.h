@@ -22,9 +22,6 @@ class SimGlue {
 
   void reset_episode(uint64_t seed);          // random cubes + home pose
   void randomize_cubes(uint64_t seed);        // cubes only (stress benchmark)
-  // global-ish IK: multi-seed damped LS, used when the cartesian target jumps
-  // (phase transitions) to escape local minima of the incremental IK.
-  void global_ik(const float tgt[3]);
 
   // one 10 ms control cycle: mj_step x substeps, then perception+control,
   // then torque write to ctrl. `frame` = event-camera RGB input.

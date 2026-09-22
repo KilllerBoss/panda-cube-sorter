@@ -184,159 +184,6 @@ void SimGlue::refresh_eval() {
   }
 }
 
-void SimGlue::global_ik(const float tgt[3]) {
-  // multi-seed damped-LS IK (kinematics only, cheap) — mirrors
-  // scene/check_kinematics.py seed strategy. Restores the real qpos after.
-  static const float seeds[5][7] = {
-    {0.009f, -0.211f, 0.040f, -1.305f, -0.005f, 3.063f, 0.004f},   // home
-    {0.0f, 0.35f, 0.0f, -1.8f, 0.0f, 3.02f, 0.0f},                 // elbow low
-    {0.0f, -0.5f, 0.0f, -1.2f, 0.0f, 3.27f, 0.0f},                 // elbow high
-    {0.4f, 0.2f, 0.6f, -1.9f, -0.3f, 3.27f, 0.3f},
-    {-0.4f, 0.1f, -0.5f, -2.2f, 0.3f, 3.62f, -0.4f},
-  };
-  float seeds7[7][7];
-  for (int i = 0; i < 5; ++i) memcpy(seeds7[i], seeds[i], sizeof(seeds[i]));
-  // analytic seeds: base yaw aimed at the target, approach down
-  const float j1 = atan2f(tgt[1], std::max(tgt[0], 0.05f));
-  { float s[7] = {j1, 0.30f, 0.0f, -1.60f, 0.0f, (float)(M_PI / 2 + 1.30), 0.0f};
-    memcpy(seeds7[5], s, sizeof(s)); }
-  { float s[7] = {j1, 0.10f, 0.0f, -1.90f, 0.0f, (float)(M_PI / 2 + 1.80), 0.0f};
-    memcpy(seeds7[6], s, sizeof(s)); }
-  float real_q[7];
-  for (int j = 0; j < 7; ++j) real_q[j] = (float)d_->qpos[m_->jnt_qposadr[jnt_arm_[j]]];
-
-  float best_q[7], best_err = 1e9f;      // fallback (most accurate)
-  float near_q[7], near_err = 1e9f;      // among accurate: closest to hint
-  bool have_near = false;
-  const float kOri = 0.8f;
-  for (int s = 0; s < 7; ++s) {
-    float q[7];
-    for (int j = 0; j < 7; ++j) {
-      q[j] = seeds7[s][j];
-      const mjtNum lo = m_->jnt_range[2 * jnt_arm_[j]] + 0.02;
-      const mjtNum hi = m_->jnt_range[2 * jnt_arm_[j] + 1] - 0.02;
-      q[j] = (float)std::min(std::max((mjtNum)q[j], lo), hi);
-      d_->qpos[m_->jnt_qposadr[jnt_arm_[j]]] = q[j];
-    }
-    for (int it = 0; it < 200; ++it) {
-      mj_kinematics(m_, d_);
-      mj_comPos(m_, d_);
-      const mjtNum* sp = d_->site_xpos + 3 * site_tcp_;
-      const mjtNum* Rx = d_->site_xmat + 9 * site_tcp_;  // col-major 3x3
-      float ep[3] = {(float)(tgt[0] - sp[0]), (float)(tgt[1] - sp[1]),
-                     (float)(tgt[2] - sp[2])};
-      float ez[3] = {(float)(-Rx[0]), (float)(-Rx[3]), (float)(-1.0 - Rx[6])};
-      mj_jacSite(m_, d_, jacp_.data(), jacr_.data(), site_tcp_);
-      // 6x6 damped LS: J = [jp ; kOri*jr]
-      mjtNum A[36], b[6];
-      for (int r = 0; r < 6; ++r)
-        for (int q2 = 0; q2 < 6; ++q2) {
-          mjtNum acc = (r == q2 ? 1e-3 : 0.0);
-          for (int j = 0; j < 7; ++j) {
-            mjtNum jr = (r < 3)
-              ? jacp_[(size_t)r * m_->nv + j]
-              : kOri * jacr_[(size_t)(r - 3) * m_->nv + j];
-            mjtNum jc = (q2 < 3)
-              ? jacp_[(size_t)q2 * m_->nv + j]
-              : kOri * jacr_[(size_t)(q2 - 3) * m_->nv + j];
-            acc += jr * jc;
-          }
-          A[r * 6 + q2] = acc;
-        }
-      for (int r = 0; r < 3; ++r) { b[r] = ep[r]; b[3 + r] = kOri * ez[r]; }
-      // closed-form 6x6 solve (Gauss, pivoting-free with damping — well conditioned)
-      mjtNum M[36];
-      memcpy(M, A, sizeof(M));
-      mjtNum x[6];
-      memcpy(x, b, sizeof(x));
-      for (int col = 0; col < 6; ++col) {
-        int piv = col;
-        for (int r = col + 1; r < 6; ++r)
-          if (fabs(M[r * 6 + col]) > fabs(M[piv * 6 + col])) piv = r;
-        if (piv != col)
-          for (int c2 = 0; c2 < 6; ++c2) {
-            std::swap(M[col * 6 + c2], M[piv * 6 + c2]);
-            std::swap(x[col], x[piv]);
-          }
-        if (fabs(M[col * 6 + col]) < 1e-12) continue;
-        for (int r = col + 1; r < 6; ++r) {
-          const mjtNum f = M[r * 6 + col] / M[col * 6 + col];
-          for (int c2 = col; c2 < 6; ++c2) M[r * 6 + c2] -= f * M[col * 6 + c2];
-          x[r] -= f * x[col];
-        }
-      }
-      mjtNum y[6];
-      for (int r = 5; r >= 0; --r) {
-        mjtNum acc = x[r];
-        for (int c2 = r + 1; c2 < 6; ++c2) acc -= M[r * 6 + c2] * y[c2];
-        y[r] = acc / (fabs(M[r * 6 + r]) < 1e-12 ? 1e-12 : M[r * 6 + r]);
-      }
-      // nullspace projector: N = I - J^T (J J^T + damp I)^-1 J  (7x7, A already
-      // equals J J^T + damp I from the 6x6 build above with kOri weights)
-      for (int j = 0; j < 7; ++j) {
-        mjtNum dq = 0;
-        for (int r = 0; r < 3; ++r) dq += jacp_[(size_t)r * m_->nv + j] * y[r];
-        for (int r = 0; r < 3; ++r) dq += kOri * jacr_[(size_t)r * m_->nv + j] * y[3 + r];
-        // N @ (q_seed - q): rows of N computed on the fly
-        mjtNum nq[7];
-        for (int k = 0; k < 7; ++k) {
-          mjtNum acc = seeds7[s][k] - q[k];
-          for (int r2 = 0; r2 < 6; ++r2) {
-            mjtNum Jk = (r2 < 3) ? jacp_[(size_t)r2 * m_->nv + k]
-                                 : kOri * jacr_[(size_t)(r2 - 3) * m_->nv + k];
-            mjtNum Jy = 0;
-            for (int c2 = 0; c2 < 6; ++c2) {
-              mjtNum Jc = (c2 < 3) ? jacp_[(size_t)c2 * m_->nv + k]
-                                   : kOri * jacr_[(size_t)(c2 - 3) * m_->nv + k];
-              Jy += A[r2 * 6 + c2] * Jc;
-            }
-            acc -= Jy * Jk;
-          }
-          nq[k] = acc;
-        }
-        for (int k = 0; k < 7; ++k) {
-          mjtNum Jk = (k < 3) ? jacp_[(size_t)k * m_->nv + j]
-                              : kOri * jacr_[(size_t)(k - 3) * m_->nv + j];
-          dq += 0.10 * Jk * nq[k];
-        }
-        q[j] += (float)dq;
-        const mjtNum lo = m_->jnt_range[2 * jnt_arm_[j]] + 0.02;
-        const mjtNum hi = m_->jnt_range[2 * jnt_arm_[j] + 1] - 0.02;
-        q[j] = (float)std::min(std::max((mjtNum)q[j], lo), hi);
-        d_->qpos[m_->jnt_qposadr[jnt_arm_[j]]] = q[j];
-      }
-    }
-    mj_kinematics(m_, d_);
-    const mjtNum* sp = d_->site_xpos + 3 * site_tcp_;
-    const mjtNum* Rm = d_->site_xmat + 9 * site_tcp_;
-    float perr = sqrtf((tgt[0]-sp[0])*(tgt[0]-sp[0]) + (tgt[1]-sp[1])*(tgt[1]-sp[1])
-                     + (tgt[2]-sp[2])*(tgt[2]-sp[2]));
-    const float oerr = fabsf(1.0f + (float)Rm[6]);  // approach z toward -1
-    if (perr < best_err) {
-      best_err = perr;
-      for (int j = 0; j < 7; ++j) best_q[j] = q[j];
-    }
-    if (perr < 0.035f && oerr < 0.6f) {            // accuracy gate
-      float qdist = 0.f;
-      for (int j = 0; j < 7; ++j) qdist += (q[j] - q_goal_[j]) * (q[j] - q_goal_[j]);
-      const float score = 0.3f * oerr + 0.5f * sqrtf(qdist);
-      if (score < near_err) {
-        near_err = score;
-        for (int j = 0; j < 7; ++j) near_q[j] = q[j];
-        have_near = true;
-      }
-    }
-  }
-  if (have_near) { for (int j = 0; j < 7; ++j) best_q[j] = near_q[j]; }
-  // restore real simulation state, then commit the best IK solution to q_goal_
-  for (int j = 0; j < 7; ++j) d_->qpos[m_->jnt_qposadr[jnt_arm_[j]]] = real_q[j];
-  mj_kinematics(m_, d_);
-  mj_comPos(m_, d_);
-  for (int j = 0; j < 7; ++j) q_goal_[j] = best_q[j];
-  have_tgt_ = true;
-  last_tgt_[0] = tgt[0]; last_tgt_[1] = tgt[1]; last_tgt_[2] = tgt[2];
-}
-
 void SimGlue::step_cycle(Controller& c, ControllerOutput& out,
                          const uint8_t* frame, int fw, int fh, bool refresh) {
   // ---- physics (budget-critical part) ----
@@ -384,6 +231,15 @@ void SimGlue::step_cycle(Controller& c, ControllerOutput& out,
     q_fold(atan2f(tgt[1], tgt[0]), rr, tgt[2], q_goal_);
   }
   have_tgt_ = true;
+
+  // commit the IK solution as the task goal and synthesize the final q_des:
+  //   q_des = q_start + (q_goal - q_start) * minjerk(s) + texture(q_add)
+  for (int j = 0; j < 7; ++j) {
+    out.task.q_goal[j] = q_goal_[j];
+    out.q_des[j] = out.task.q_start[j]
+      + (q_goal_[j] - out.task.q_start[j]) * minjerk(out.task.s)
+      + out.q_add[j];
+  }
 
   // ---- torques: tau = qfrc_bias + kp (q_des - q) - kd qd   (gravity/Coriolis
   //      compensation from mjData, PD around the synthesized trajectory) ----

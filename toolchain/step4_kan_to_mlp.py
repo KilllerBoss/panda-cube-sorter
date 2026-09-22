@@ -64,6 +64,7 @@ def main():
     assert e_h < 1e-3 and e_l < 1e-3, "KAN->MLP compile mismatch"
 
     np.savez(os.path.join(HERE, "kan_compiled.npz"),
+             in_scale=km["in_scale"].astype(np.float32),
              w1=w1, b1=b1.astype(np.float32),
              w2=w2, b2=b2.astype(np.float32),
              hinge_t1=hinge_t1, hinge_t2=hinge_t2)

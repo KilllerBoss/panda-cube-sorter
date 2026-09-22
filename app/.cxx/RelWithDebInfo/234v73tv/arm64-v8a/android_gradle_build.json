@@ -1,0 +1,40 @@
+{
+  "buildFiles": [
+    "/home/z/my-project/download/panda-cube-sorter/app/src/main/cpp/CMakeLists.txt"
+  ],
+  "cleanCommandsComponents": [
+    [
+      "/home/z/my-project/android-sdk/cmake/3.22.1/bin/ninja",
+      "-C",
+      "/home/z/my-project/download/panda-cube-sorter/app/.cxx/RelWithDebInfo/234v73tv/arm64-v8a",
+      "clean"
+    ]
+  ],
+  "buildTargetsCommandComponents": [
+    "/home/z/my-project/android-sdk/cmake/3.22.1/bin/ninja",
+    "-C",
+    "/home/z/my-project/download/panda-cube-sorter/app/.cxx/RelWithDebInfo/234v73tv/arm64-v8a",
+    "{LIST_OF_TARGETS_TO_BUILD}"
+  ],
+  "libraries": {
+    "panda_sorter::@6890427a1f51a3e7e1df": {
+      "toolchain": "toolchain",
+      "abi": "arm64-v8a",
+      "artifactName": "panda_sorter",
+      "output": "/home/z/my-project/download/panda-cube-sorter/app/build/intermediates/cxx/RelWithDebInfo/234v73tv/obj/arm64-v8a/libpanda_sorter.so",
+      "runtimeFiles": [
+        "/home/z/my-project/download/panda-cube-sorter/app/libs/arm64-v8a/libmujoco.so"
+      ]
+    }
+  },
+  "toolchains": {
+    "toolchain": {
+      "cCompilerExecutable": "/home/z/my-project/android-sdk/ndk/27.1.12297006/toolchains/llvm/prebuilt/linux-x86_64/bin/clang.lld",
+      "cppCompilerExecutable": "/home/z/my-project/android-sdk/ndk/27.1.12297006/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++.lld"
+    }
+  },
+  "cFileExtensions": [],
+  "cppFileExtensions": [
+    "cpp"
+  ]
+}
