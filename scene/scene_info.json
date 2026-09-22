@@ -1,0 +1,24 @@
+[
+  {
+    "name": "scene_8.mjb",
+    "file": "scene_8.mjb",
+    "nq": 65,
+    "nv": 57,
+    "nu": 8,
+    "nbody": 25,
+    "ngeom": 26,
+    "total_mass_kg": 220.85,
+    "timestep": 0.002
+  },
+  {
+    "name": "scene_50.mjb",
+    "file": "scene_50.mjb",
+    "nq": 359,
+    "nv": 309,
+    "nu": 8,
+    "nbody": 67,
+    "ngeom": 68,
+    "total_mass_kg": 224.21,
+    "timestep": 0.002
+  }
+]

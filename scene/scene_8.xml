@@ -1,0 +1,184 @@
+<!--
+  panda-cube-sorter: scene template
+  Panda-class 7-DOF arm (Franka-like joint convention & lengths, simplified geometry),
+  parallel gripper (tendon-coupled), table, 4 colored sorting zones, colored cubes.
+  The <!--CUBES--> marker is replaced by scene/compile_scene.py with N cube bodies.
+  Final scenes are compiled to binary .mjb (no XML parsing at app startup).
+-->
+<mujoco model="panda_cube_sorter">
+  <compiler angle="radian" autolimits="true" boundmass="0.01" boundinertia="1e-5"/>
+
+  <option timestep="0.002" integrator="implicitfast" cone="pyramidal"
+          solver="Newton" iterations="30" tolerance="1e-8"
+          impratio="5" gravity="0 0 -9.81"/>
+
+  <default>
+    <joint damping="0.2" armature="0.05" frictionloss="0.15"/>
+    <geom solref="0.008 1" solimp="0.95 0.99 0.001" friction="0.6 0.02 0.001" margin="0.0005"/>
+    <default class="arm">
+      <geom type="capsule" density="900" condim="3"
+            contype="1" conaffinity="2"/>
+      <joint damping="0.25" armature="0.05" frictionloss="0.2"/>
+    </default>
+    <default class="finger">
+      <geom type="box" density="4000" friction="2.5 0.02 0.001" solref="0.010 1" solimp="0.95 0.99 0.001"
+            contype="4" conaffinity="8"/>
+      <joint type="slide" damping="60" armature="0.002" frictionloss="0.4"/>
+    </default>
+    <default class="cube">
+      <geom type="box" size="0.025 0.025 0.025" mass="0.08" contype="1" conaffinity="7"
+            friction="0.75 0.02 0.002" solref="0.006 1" solimp="0.96 0.995 0.0005"/>
+    </default>
+    <default class="zone">
+      <geom type="box" contype="0" conaffinity="0" density="0"/>
+    </default>
+  </default>
+
+  <visual>
+    <headlight ambient="0.35 0.35 0.35" diffuse="0.55 0.55 0.55" specular="0.15 0.15 0.15"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="flat" rgb1="0.10 0.11 0.13" rgb2="0.10 0.11 0.13" width="32" height="32"/>
+    <material name="mat_floor" rgba="0.22 0.23 0.25 1" specular="0.1" shininess="0.2"/>
+    <material name="mat_table" rgba="0.45 0.38 0.30 1" specular="0.15" shininess="0.3"/>
+    <material name="mat_arm"   rgba="0.85 0.85 0.87 1" specular="0.4" shininess="0.6"/>
+    <material name="mat_link2" rgba="0.95 0.55 0.10 1" specular="0.4" shininess="0.6"/>
+    <material name="mat_hand"  rgba="0.12 0.12 0.13 1" specular="0.3" shininess="0.5"/>
+  </asset>
+
+  <worldbody>
+    <light name="top"    pos="0.55 0.0 1.60" dir="0 0 -1" diffuse="0.75 0.75 0.75" specular="0.2 0.2 0.2" castshadow="false"/>
+    <light name="fill"   pos="0.2 -0.8 1.20" dir="0.35 0.6 -1" diffuse="0.30 0.30 0.32" castshadow="false"/>
+    <geom name="floor" type="plane" size="4 4 0.05" material="mat_floor"/>
+
+    <!-- ============ Panda-class arm (base at origin, front = +x) ============ -->
+    <body name="link0" pos="0 0 0">
+      <geom name="l0_base" class="arm"  type="cylinder" size="0.055 0.045" pos="0 0 0.045" material="mat_arm"/>
+      <geom name="l0_disc" class="arm"  type="cylinder" size="0.070 0.012" pos="0 0 0.012" material="mat_hand"/>
+      <body name="link1" pos="0 0 0.333">
+        <joint name="joint1" type="hinge" axis="0 0 1" range="-2.8973 2.8973"/>
+        <geom name="l1" class="arm" type="capsule" fromto="0 0 0.02 0 0 0.10" size="0.052" material="mat_arm"/>
+        <body name="link2" pos="0 0 0">
+          <joint name="joint2" type="hinge" axis="0 1 0" range="-1.7628 1.7628"/>
+          <geom name="l2" class="arm" type="capsule" fromto="0 0 0 0.24 0 0" size="0.050" material="mat_link2"/>
+          <body name="link3" pos="0.316 0 0">
+            <joint name="joint3" type="hinge" axis="1 0 0" range="-2.8973 2.8973"/>
+            <geom name="l3" class="arm" type="capsule" fromto="0 0 0 0.0825 0 0" size="0.045" material="mat_arm"/>
+            <body name="link4" pos="0.0825 0 0">
+              <joint name="joint4" type="hinge" axis="0 1 0" range="-3.0718 3.0718"/><!-- simplified: elbow-up branch -->
+              <geom name="l4" class="arm" type="capsule" fromto="0 0 0 0.28 0 0" size="0.040" material="mat_arm"/>
+              <body name="link5" pos="0.302 0 0">
+                <joint name="joint5" type="hinge" axis="1 0 0" range="-2.8973 2.8973"/>
+                <geom name="l5" class="arm" type="capsule" fromto="0 0 0 0.0825 0 0" size="0.036" material="mat_link2"/>
+                <body name="link6" pos="0.0825 0 0">
+                  <joint name="joint6" type="hinge" axis="0 1 0" range="-0.0175 3.7525"/>
+                  <geom name="l6" class="arm" type="capsule" fromto="0 0 0 0.088 0 0" size="0.032" material="mat_arm"/>
+                  <body name="link7" pos="0.088 0 0">
+                    <joint name="joint7" type="hinge" axis="1 0 0" range="-2.8973 2.8973"/>
+                    <geom name="l7" class="arm" type="capsule" fromto="0 0 0 0.045 0 0" size="0.030" material="mat_arm"/>
+                    <!-- flange + parallel gripper (approach = local +x) -->
+                    <body name="hand" pos="0.107 0 0">
+                      <geom name="hand_palm" type="box" size="0.024 0.040 0.024" pos="0.024 0 0" material="mat_hand" contype="1" conaffinity="2"/>
+                      <site name="tcp" pos="0.126 0 0" size="0.006" rgba="1 0 0 0.4"/>
+                      <camera name="cam_grip" pos="0.02 0 0.06" xyaxes="0 0 -1 0 1 0" fovy="90"/>
+                      <body name="finger_l" pos="0.052 0.0225 0">
+                        <joint name="finger_l_j" type="slide" axis="0 1 0" range="0 0.025"/>
+                        <geom name="finger_l_g" size="0.042 0.006 0.011" pos="0.042 0 0" class="finger" material="mat_hand"/>
+                      </body>
+                      <body name="finger_r" pos="0.052 -0.0225 0">
+                        <joint name="finger_r_j" type="slide" axis="0 1 0" range="0 0.025"/>
+                        <geom name="finger_r_g" size="0.042 0.006 0.011" pos="0.042 0 0" class="finger" material="mat_hand"/>
+                      </body>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+
+    <!-- ============ Table + sorting zones ============ -->
+    <body name="table" pos="0.62 0 0.125">
+      <geom name="table_g" type="box" size="0.53 0.40 0.125" material="mat_table" contype="1" conaffinity="5"/>
+      <body name="zone_red"    pos="-0.26 -0.26 0.129">
+        <geom name="zone_red_g"    size="0.070 0.070 0.004" rgba="0.90 0.12 0.12 1" class="zone"/>
+      </body>
+      <body name="zone_green"  pos="-0.26  0.26 0.129">
+        <geom name="zone_green_g"  size="0.070 0.070 0.004" rgba="0.12 0.80 0.20 1" class="zone"/>
+      </body>
+      <body name="zone_blue"   pos="-0.14 -0.12 0.129">
+        <geom name="zone_blue_g"   size="0.070 0.070 0.004" rgba="0.15 0.35 0.95 1" class="zone"/>
+      </body>
+      <body name="zone_yellow" pos="-0.14  0.12 0.129">
+        <geom name="zone_yellow_g" size="0.070 0.070 0.004" rgba="0.95 0.85 0.15 1" class="zone"/>
+      </body>
+    </body>
+
+    <!-- ============ Cubes (injected by compile_scene.py) ============ -->
+    <body name="cube_red_0" pos="0.4435 -0.0192 0.2750">
+      <freejoint name="free_red_0"/>
+      <geom name="geom_red_0" class="cube" rgba="0.92 0.1 0.1 1.0"/>
+      <site name="site_red_0" pos="0 0 0" size="0.004" rgba="0.92 0.1 0.1 0.6" type="sphere"/>
+    </body>
+    <body name="cube_green_1" pos="0.3545 -0.1329 0.2750">
+      <freejoint name="free_green_1"/>
+      <geom name="geom_green_1" class="cube" rgba="0.1 0.82 0.18 1.0"/>
+      <site name="site_green_1" pos="0 0 0" size="0.004" rgba="0.1 0.82 0.18 0.6" type="sphere"/>
+    </body>
+    <body name="cube_blue_2" pos="0.3908 0.0321 0.2750">
+      <freejoint name="free_blue_2"/>
+      <geom name="geom_blue_2" class="cube" rgba="0.15 0.35 0.95 1.0"/>
+      <site name="site_blue_2" pos="0 0 0" size="0.004" rgba="0.15 0.35 0.95 0.6" type="sphere"/>
+    </body>
+    <body name="cube_yellow_3" pos="0.4494 -0.2073 0.2750">
+      <freejoint name="free_yellow_3"/>
+      <geom name="geom_yellow_3" class="cube" rgba="0.95 0.85 0.12 1.0"/>
+      <site name="site_yellow_3" pos="0 0 0" size="0.004" rgba="0.95 0.85 0.12 0.6" type="sphere"/>
+    </body>
+    <body name="cube_red_4" pos="0.4025 -0.0742 0.2750">
+      <freejoint name="free_red_4"/>
+      <geom name="geom_red_4" class="cube" rgba="0.92 0.1 0.1 1.0"/>
+      <site name="site_red_4" pos="0 0 0" size="0.004" rgba="0.92 0.1 0.1 0.6" type="sphere"/>
+    </body>
+    <body name="cube_green_5" pos="0.3580 0.1508 0.2750">
+      <freejoint name="free_green_5"/>
+      <geom name="geom_green_5" class="cube" rgba="0.1 0.82 0.18 1.0"/>
+      <site name="site_green_5" pos="0 0 0" size="0.004" rgba="0.1 0.82 0.18 0.6" type="sphere"/>
+    </body>
+    <body name="cube_blue_6" pos="0.3822 0.0943 0.2750">
+      <freejoint name="free_blue_6"/>
+      <geom name="geom_blue_6" class="cube" rgba="0.15 0.35 0.95 1.0"/>
+      <site name="site_blue_6" pos="0 0 0" size="0.004" rgba="0.15 0.35 0.95 0.6" type="sphere"/>
+    </body>
+    <body name="cube_yellow_7" pos="0.3594 -0.0255 0.2750">
+      <freejoint name="free_yellow_7"/>
+      <geom name="geom_yellow_7" class="cube" rgba="0.95 0.85 0.12 1.0"/>
+      <site name="site_yellow_7" pos="0 0 0" size="0.004" rgba="0.95 0.85 0.12 0.6" type="sphere"/>
+    </body>
+
+    <!-- ============ Cameras ============ -->
+    <camera name="cam_event" pos="0.42 0 1.05" xyaxes="1 0 0 0 1 0" fovy="78"/>
+    <camera name="cam_track" mode="targetbody" target="table" pos="1.45 -1.25 0.95" fovy="55"/>
+  </worldbody>
+
+  <tendon>
+    <fixed name="grip_tendon">
+      <joint joint="finger_l_j" coef="1"/>
+      <joint joint="finger_r_j" coef="1"/>
+    </fixed>
+  </tendon>
+
+  <actuator>
+    <motor name="m1" joint="joint1" gear="1" ctrlrange="-87 87"/>
+    <motor name="m2" joint="joint2" gear="1" ctrlrange="-87 87"/>
+    <motor name="m3" joint="joint3" gear="1" ctrlrange="-87 87"/>
+    <motor name="m4" joint="joint4" gear="1" ctrlrange="-87 87"/>
+    <motor name="m5" joint="joint5" gear="1" ctrlrange="-12 12"/>
+    <motor name="m6" joint="joint6" gear="1" ctrlrange="-12 12"/>
+    <motor name="m7" joint="joint7" gear="1" ctrlrange="-12 12"/>
+    <position name="grip_act" tendon="grip_tendon" kp="120" ctrlrange="0 0.05"/>
+  </actuator>
+</mujoco>

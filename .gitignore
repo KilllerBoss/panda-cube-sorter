@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+dataset.npz
+init_weights.npz
+prototypes.npz
+kan_model.npz
+kan_compiled.npz
+heads.npz
+build*/
+.gradle-home/
+.android-home/
+local.properties
+*.log
