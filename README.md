@@ -58,11 +58,40 @@ und zeigte nur Schwarz. Zwei weitere Fehler wurden zusätzlich behoben:
 
 Bei **E5** hilft: `adb logcat -s panda-sorter` — der MuJoCo-Fehlertext steht dort im Klartext.
 
+## Änderungen in v1.0.2 — E7-Fix (EGL-Bindung des Loop-Threads)
+
+**Feldbericht v1.0.1:** Roter Screen mit **E7** (= EGL-Fehler). Für die Diagnose wertvoll:
+Damit E7 überhaupt *sichtbar* sein kann, funktioniert der Worker-Render-Thread bereits —
+die EGL-Bindung des 100-Hz-Loop-Threads schlug fehl. Ursache: Loop-Thread und Worker
+*treten denselben EGL-Window-Surface* — Treiber, die das nur in einem Thread erlauben,
+verweigern `eglMakeCurrent` im Loop-Thread.
+
+**Fix:** Der Loop-Thread rendert ausschließlich in ein FBO (kein Swap!) — er braucht das
+Window-Surface gar nicht. Neue Fallback-Kette, erster Erfolg gewinnt:
+
+1. `EGL_KHR_surfaceless_context` — Kontext ohne Surface (das macht SurfaceFlinger selbst so)
+2. dedizierter 1×1-**PBuffer** für den Loop-Thread
+3. dedizierter **zweiter Window-Surface** auf demselben Fenster (je Thread ein Surface)
+4. Legacy: geteilter Surface (v1.0.1-Verhalten, allerletzte Rettung)
+
+Zusätzlich:
+- **Fehler-Screen mit Hex-Unterzeile:** bei E2–E8 wird der rohe EGL-Fehlercode klein darunter
+  angezeigt, z. B. `E7` + `0X3009` — sofort vom Foto ablesbar.
+- **RGB565-Config-Fallback**, falls der Treiber keine passenden RGBA8888-Konfigurationen bietet.
+- **Selbstheilung:** ein E7 aus einem früheren Window-Zyklus blockiert keine neue Episode
+  mehr; jede Window-Neuerstellung probiert die Kette frisch durch.
+- **Diagnose-Report:** `pcs_error.txt` im App-internen Speicher enthält jetzt EGL_VENDOR/
+  EGL_VERSION, GL_RENDERER/GL_VERSION, ob Surfaceless verfügbar ist, welche Fallback-Stufe
+  gewählt wurde und alle EGL-Fehlercodes der fehlgeschlagenen Versuche.
+
+Bei hartnäckigem E7: `adb logcat -d -s panda-sorter > pcs_log.txt` schicken — der Report
+enthält dann den exakten Treiber/Fehlerpunkt.
+
 ## Schnellstart auf dem S26 Ultra
 
 ```bash
 # 1) APK herunterladen (Release-Seite) oder aus apk/ nehmen
-adb install -r apk/PandaCubeSorter-v1.0.1-release.apk
+adb install -r apk/PandaCubeSorter-v1.0.2-release.apk
 
 # 2) App starten ("Panda Cube Sorter"), Flugzeugmodus an — sie läuft autark
 

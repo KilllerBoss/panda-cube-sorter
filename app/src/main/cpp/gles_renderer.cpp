@@ -353,7 +353,7 @@ int gles_win_w() { return g_win_w; }
 int gles_win_h() { return g_win_h; }
 
 // 3x5 pixel glyphs, rows top->bottom (bit 2 = leftmost column)
-static const uint8_t kFont[12][5] = {
+static const uint8_t kFont[18][5] = {
     {7, 5, 5, 5, 7},   // 0
     {2, 6, 2, 2, 7},   // 1
     {7, 1, 7, 4, 7},   // 2
@@ -365,16 +365,52 @@ static const uint8_t kFont[12][5] = {
     {7, 5, 7, 5, 7},   // 8
     {7, 5, 7, 1, 7},   // 9
     {7, 4, 6, 4, 7},   // E
-    {4, 4, 4, 4, 7}};  // L
+    {4, 4, 4, 4, 7},   // L
+    {2, 5, 7, 5, 5},   // A
+    {6, 5, 6, 5, 6},   // B
+    {3, 4, 4, 4, 3},   // C
+    {6, 5, 5, 5, 6},   // D
+    {7, 4, 6, 4, 4},   // F
+    {5, 5, 2, 5, 5}};  // X
 
 static const uint8_t* glyph_of(char c) {
   if (c >= '0' && c <= '9') return kFont[c - '0'];
   if (c == 'E') return kFont[10];
   if (c == 'L') return kFont[11];
+  if (c >= 'A' && c <= 'F') return kFont[c - 'A' + 12];
+  if (c == 'X') return kFont[17];
   return kFont[0];
 }
 
-void gles_render_status(int code, int win_w, int win_h) {
+// append one text line as screen-space quad triangles
+static void text_quads(std::vector<float>& v, const char* s, float x0,
+                       float y0, float scale, int win_w, int win_h) {
+  float gx = 0;
+  for (const char* p = s; *p; ++p, gx += 3 * scale + scale) {
+    const uint8_t* g = glyph_of(*p);
+    for (int r = 0; r < 5; ++r) {
+      for (int c = 0; c < 3; ++c) {
+        if (!((g[r] >> (2 - c)) & 1)) continue;
+        const float px = x0 + gx + c * scale;
+        const float py = y0 + r * scale;
+        const float xa = 2.f * px / win_w - 1.f;
+        const float xb = 2.f * (px + scale) / win_w - 1.f;
+        const float ya = 1.f - 2.f * py / win_h;
+        const float yb = 1.f - 2.f * (py + scale) / win_h;
+        v.insert(v.end(), {xa, ya, xb, ya, xb, yb});
+        v.insert(v.end(), {xa, ya, xb, yb, xa, yb});
+      }
+    }
+  }
+}
+
+static float text_width(const char* s, float scale) {
+  int n = 0;
+  for (const char* p = s; *p; ++p) ++n;
+  return n > 0 ? n * 3 * scale + (n - 1) * scale : 0.f;
+}
+
+void gles_render_status(int code, int win_w, int win_h, const char* sub) {
   if (!g_status_prog) {
     g_status_prog = make_program(kHudVS, kHudFS);
     g_status_pos = glGetAttribLocation(g_status_prog, "aPos");
@@ -397,30 +433,22 @@ void gles_render_status(int code, int win_w, int win_h) {
   }
 
   const int scale = std::max(8, std::min(win_w, win_h) / 24);
-  const int gw = 3 * scale, gap = scale, gh = 5 * scale;
-  int total_w = 0;
-  for (const char* p = text; *p; ++p) total_w += gw + gap;
-  total_w -= gap;
-  const float x0 = (win_w - total_w) * 0.5f;
-  const float y0 = (win_h - gh) * 0.5f;
+  const float gh = 5.f * scale;
+  const float gw = text_width(text, (float)scale);
+  // optional hex sub-line (e.g. "0X3009") in half-size glyphs below the code
+  float sub_scale = 0.f;
+  if (sub && *sub) sub_scale = std::max(4.f, scale * 0.5f);
+  const float sub_h = sub_scale > 0.f ? 5.f * sub_scale + scale : 0.f;
+
+  const float x0 = (win_w - gw) * 0.5f;
+  const float y0 = (win_h - gh - sub_h) * 0.5f;
 
   std::vector<float> v;
-  int gx = 0;
-  for (const char* p = text; *p; ++p, gx += gw + gap) {
-    const uint8_t* g = glyph_of(*p);
-    for (int r = 0; r < 5; ++r) {
-      for (int c = 0; c < 3; ++c) {
-        if (!((g[r] >> (2 - c)) & 1)) continue;
-        const float px = x0 + gx + c * scale;
-        const float py = y0 + r * scale;
-        const float xa = 2.f * px / win_w - 1.f;
-        const float xb = 2.f * (px + scale) / win_w - 1.f;
-        const float ya = 1.f - 2.f * py / win_h;
-        const float yb = 1.f - 2.f * (py + scale) / win_h;
-        v.insert(v.end(), {xa, ya, xb, ya, xb, yb});
-        v.insert(v.end(), {xa, ya, xb, yb, xa, yb});
-      }
-    }
+  text_quads(v, text, x0, y0, (float)scale, win_w, win_h);
+  if (sub_scale > 0.f) {
+    const float sw = text_width(sub, sub_scale);
+    text_quads(v, sub, (win_w - sw) * 0.5f, y0 + gh + scale, sub_scale, win_w,
+               win_h);
   }
   if (v.empty()) return;
   glUseProgram(g_status_prog);

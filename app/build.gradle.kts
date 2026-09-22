@@ -11,8 +11,8 @@ android {
         applicationId = "dev.pandasorter"
         minSdk = 31
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.0.1"
+        versionCode = 3
+        versionName = "1.0.2"
         ndk { abiFilters += listOf("arm64-v8a") }
         externalNativeBuild {
             cmake { arguments += listOf("-DANDROID_STL=c++_shared") }

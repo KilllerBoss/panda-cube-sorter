@@ -29,5 +29,7 @@ int gles_win_w();
 int gles_win_h();
 
 // status / error screen: code 0 = loading (amber), >=2 = error (red + code)
-// renders "L0" or "E<n>" with a 3x5 pixel font, works without gles_init
-void gles_render_status(int code, int win_w, int win_h);
+// renders "L0" or "E<n>" with a 3x5 pixel font, works without gles_init.
+// `sub` (optional) draws a smaller hex line below (e.g. "0X3009") — glyphs
+// available: 0-9, A-F, E, L, X.
+void gles_render_status(int code, int win_w, int win_h, const char* sub = nullptr);
