@@ -100,46 +100,19 @@ static std::vector<uint8_t> g_frame(kEvW * kEvH * 3);
 static AInputQueue* g_queue = nullptr;
 static int looper_callback(int fd, int events, void* data);
 
-// UI buttons from the input thread (button hits NEVER become camera gestures)
-static bool handle_ui_touch(float x, float y) {
-  const int btn = gles_hit_button(x, y);
-  if (btn >= 0) {
-    PcsUiState s;
-    switch (btn) {
-      case BTN_START: s.toggle_run = true; break;
-      case BTN_STOP:  s.stop = true; break;
-      case BTN_FINE:  s.fine = true; break;
-      case BTN_NEW:   s.new_episode = true; break;
-      case BTN_NN:    gles_toggle_window(WIN_NN); return true;
-      case BTN_MOT:   gles_toggle_window(WIN_MOT); return true;
-      default: return true;
-    }
-    gles_push_ui(s);
-    return true;
-  }
-  const int wb = gles_hit_window_button(x, y);
-  if (wb == 0) return false;              // no UI hit -> camera gesture
-  PcsUiState s;
-  switch (wb) {
-    case 1: gles_toggle_window(WIN_NN); break;      // NN window close
-    case 2: gles_cam_reset(); break;                // NN window: KAM
-    case 3: gles_toggle_window(WIN_MOT); break;     // MOT window close
-    case 4: s.mot_record = true; break;             // AUFZ
-    case 5: s.mot_convert = true; break;            // UMW
-    case 6: s.mot_train = true; break;              // TRAIN
-    case 7: s.mot_clear = true; break;              // LOESCH
-    default: break;                                  // 8: window body
-  }
-  if (wb >= 4 && wb <= 7) gles_push_ui(s);
-  return true;
-}
+// ---------------- v1.4.0 touch: press feedback, fire-on-UP, pip tap --------
+// DOWN  -> visual press only (button shrinks/brightens); PiP becomes a tap
+// MOVE  -> press follows the finger (leaving the button un-presses)
+// UP    -> the action fires ONLY if the finger is still on the element
+//          (standard mobile UX: no accidental triggers, visible feedback)
+// Encoded ids: 0..5 bottom-bar buttons, 100+wb window buttons, pip tap flag.
 
 // ---------------- v1.3.0 touch gestures (orbit / zoom / pan) ----------------
 // One finger drag on the scene  -> orbit the camera around the target.
 // Two finger pinch              -> zoom (dolly). Two finger drag -> pan.
-// Touches on buttons/windows are consumed by handle_ui_touch and never
+// Touches on buttons/windows/pip are consumed by the UI handlers and never
 // start a gesture. A gesture ENDS when a finger lifts — the surviving
-// finger does not jump the camera (no re-seed guesswork).
+// finger does not jump the camera.
 struct Gesture {
   bool cam = false;      // gesture active (owns the camera)
   bool two = false;      // two-finger mode
@@ -150,6 +123,122 @@ struct Gesture {
 };
 static Gesture g_gest;
 
+// pending press state (input thread only — single-threaded by design)
+static int g_press_id = -1;      // pressed element, -1 none
+static bool g_pip_tap = false;   // PiP tap candidate (fires on UP)
+static float g_tap_x0 = 0.f, g_tap_y0 = 0.f;
+
+static void ui_clear_press() {
+  g_press_id = -1;
+  g_pip_tap = false;
+  gles_set_pressed(-1);
+  gles_set_pressed_wb(-1);
+}
+
+static void ui_fire_btn(int btn) {
+  PcsUiState s;
+  switch (btn) {
+    case BTN_START: s.toggle_run = true; break;
+    case BTN_STOP:  s.stop = true; break;
+    case BTN_FINE:  s.fine = true; break;
+    case BTN_NEW:   s.new_episode = true; break;
+    case BTN_NN:    gles_toggle_window(WIN_NN); return;
+    case BTN_MOT:   gles_toggle_window(WIN_MOT); return;
+    default: return;
+  }
+  gles_push_ui(s);
+}
+
+static void ui_fire_wb(int wb) {
+  PcsUiState s;
+  switch (wb) {
+    case 1: gles_toggle_window(WIN_NN); break;      // NN window close
+    case 2: gles_cam_reset();                       // NN window: KAM
+      gles_toast("KAMERA ZURUECKGESETZT", TOAST_BLUE);
+      break;
+    case 3: gles_toggle_window(WIN_MOT); break;     // MOT window close
+    case 4: s.mot_record = true; break;             // AUFZ
+    case 5: s.mot_convert = true; break;            // UMW
+    case 6: s.mot_train = true; break;              // TRAIN
+    case 7:                                          // LOESCH (2-step)
+      if (!gles_mot_confirm_armed()) {
+        gles_mot_arm_confirm();
+        gles_toast("LOESCH: ERNEUT DRUECKEN", TOAST_RED);
+        return;
+      }
+      gles_mot_disarm();
+      s.mot_clear = true;
+      break;
+    default: return;                                 // 8: window body
+  }
+  if (wb >= 4 && wb <= 7) gles_push_ui(s);
+}
+
+// ACTION_DOWN: begin a press (visual only). true = touch consumed by UI.
+static bool handle_ui_down(float x, float y) {
+  ui_clear_press();
+  if (gles_hit_pip(x, y)) {           // robot camera: tap toggles large view
+    g_pip_tap = true;
+    g_tap_x0 = x; g_tap_y0 = y;
+    return true;
+  }
+  const int btn = gles_hit_button(x, y);
+  if (btn >= 0) {
+    g_press_id = btn;
+    gles_set_pressed(btn);
+    return true;
+  }
+  const int wb = gles_hit_window_button(x, y);
+  if (wb > 0) {
+    if (wb != 8) {                    // window body consumes silently
+      g_press_id = 100 + wb;
+      gles_set_pressed_wb(wb);
+    }
+    return true;
+  }
+  return false;                       // scene -> camera gesture
+}
+
+// ACTION_MOVE: keep the press alive only while the finger stays on it.
+// A PiP tap that turns into a drag becomes a camera orbit.
+static void handle_ui_move(float x, float y) {
+  if (g_pip_tap) {
+    const float dx = x - g_tap_x0, dy = y - g_tap_y0;
+    if (dx * dx + dy * dy > 24.f * 24.f) {
+      g_pip_tap = false;
+      g_gest.cam = true;
+      g_gest.two = false;
+      g_gest.lx = x; g_gest.ly = y;
+    }
+    return;
+  }
+  if (g_press_id < 0) return;
+  if (g_press_id < 100) {
+    gles_set_pressed(gles_hit_button(x, y) == g_press_id ? g_press_id : -1);
+  } else {
+    const int wb = g_press_id - 100;
+    gles_set_pressed_wb(gles_hit_window_button(x, y) == wb ? wb : -1);
+  }
+}
+
+// ACTION_UP: fire the action if the finger is still on the pressed element
+static void handle_ui_up(float x, float y) {
+  if (g_pip_tap) {
+    ui_clear_press();
+    gles_pip_set_big(!gles_pip_big());
+    return;
+  }
+  const int id = g_press_id;
+  ui_clear_press();
+  if (id < 0) return;
+  if (id < 100) {
+    if (gles_hit_button(x, y) == id) ui_fire_btn(id);
+  } else {
+    const int wb = id - 100;
+    if (gles_hit_window_button(x, y) == wb) ui_fire_wb(wb);
+  }
+}
+
 static void handle_motion_event(AInputEvent* ev) {
   const int32_t action = AMotionEvent_getAction(ev);
   const int32_t plain = action & AMOTION_EVENT_ACTION_MASK;
@@ -159,13 +248,15 @@ static void handle_motion_event(AInputEvent* ev) {
     case AMOTION_EVENT_ACTION_DOWN: {
       const float x = AMotionEvent_getX(ev, 0);
       const float y = AMotionEvent_getY(ev, 0);
-      if (handle_ui_touch(x, y)) { g_gest = Gesture{}; return; }
+      if (handle_ui_down(x, y)) { g_gest = Gesture{}; return; }
       g_gest.cam = true;
       g_gest.two = false;
       g_gest.lx = x; g_gest.ly = y;
       return;
     }
     case AMOTION_EVENT_ACTION_POINTER_DOWN: {
+      // a second finger cancels any pending press / tap
+      ui_clear_press();
       if (g_gest.cam && n >= 2) {
         // switch to two-finger mode: seed pinch + pan reference
         g_gest.two = true;
@@ -182,11 +273,11 @@ static void handle_motion_event(AInputEvent* ev) {
       return;
     }
     case AMOTION_EVENT_ACTION_MOVE: {
+      const float x = AMotionEvent_getX(ev, 0);
+      const float y = AMotionEvent_getY(ev, 0);
+      if (g_pip_tap || g_press_id >= 0) { handle_ui_move(x, y); return; }
       if (!g_gest.cam) return;
       if (!g_gest.two) {
-        if (n < 1) return;
-        const float x = AMotionEvent_getX(ev, 0);
-        const float y = AMotionEvent_getY(ev, 0);
         const float dx = x - g_gest.lx, dy = y - g_gest.ly;
         g_gest.lx = x; g_gest.ly = y;
         // 0.0038 rad/px: a full-screen drag turns the scene ~1.3x
@@ -215,10 +306,18 @@ static void handle_motion_event(AInputEvent* ev) {
     }
     case AMOTION_EVENT_ACTION_POINTER_UP:
       // a two-finger gesture loses a finger -> end it completely
+      ui_clear_press();
       g_gest = Gesture{};
       return;
-    case AMOTION_EVENT_ACTION_UP:
+    case AMOTION_EVENT_ACTION_UP: {
+      const float x = AMotionEvent_getX(ev, 0);
+      const float y = AMotionEvent_getY(ev, 0);
+      handle_ui_up(x, y);
+      g_gest = Gesture{};
+      return;
+    }
     case AMOTION_EVENT_ACTION_CANCEL:
+      ui_clear_press();
       g_gest = Gesture{};
       return;
     default:
@@ -727,15 +826,20 @@ static void execution_loop() {
       g_paused = now;
       if (!now) g_glue.set_halt(false);  // START also releases a STOP
       LOGI("button: %s", now ? "PAUSE" : "START");
+      gles_toast(now ? "PAUSIERT" : "GESTARTET",
+                 now ? TOAST_AMBER : TOAST_GREEN);
     }
     if (ui.stop) {
       g_glue.set_halt(!g_glue.halted());  // STOP toggles freeze
       LOGI("button: STOP -> %s", g_glue.halted() ? "halt" : "run");
+      gles_toast(g_glue.halted() ? "ROBOTER GESTOPPT" : "LAEUFT WIEDER",
+                 g_glue.halted() ? TOAST_RED : TOAST_GREEN);
     }
     if (ui.fine) {
       g_ctrl.finetune(32);
       g_fine_until = (int)cyc + 150;  // show "FINE" for ~1.5 s
       LOGI("button: FINETUNE burst");
+      gles_toast("FINETUNE: 32 UPDATES", TOAST_ORANGE);
     }
     if (ui.new_episode) g_new_episode = true;
     if (ui.mot_record) {
@@ -748,13 +852,24 @@ static void execution_loop() {
                  (unsigned)g_clips.back().s.size());
         LOGI("motion: recorded %u samples (%u clips)",
              (unsigned)g_clips.back().s.size(), (unsigned)g_clips.size());
+        gles_toast(g_mot_msg, TOAST_TEAL);
       } else {
         snprintf(g_mot_msg, sizeof g_mot_msg, "NOCH KEINE BEWEGUNG");
+        gles_toast(g_mot_msg, TOAST_GRAY);
       }
     }
-    if (ui.mot_convert) mot_convert_all();
-    if (ui.mot_train) mot_train(g_ctrl);
-    if (ui.mot_clear) mot_clear_all();
+    if (ui.mot_convert) {
+      mot_convert_all();
+      gles_toast(g_mot_msg, TOAST_BLUE);
+    }
+    if (ui.mot_train) {
+      mot_train(g_ctrl);
+      gles_toast(g_mot_msg, TOAST_ORANGE);
+    }
+    if (ui.mot_clear) {
+      mot_clear_all();
+      gles_toast("MOTION DATEN GELOESCHT", TOAST_RED);
+    }
 
     if (g_new_episode.exchange(false)) {
       ++episode;
@@ -763,6 +878,7 @@ static void execution_loop() {
       g_ctrl.reset();
       g_glue.set_halt(false);
       LOGI("new episode %llu", (unsigned long long)episode);
+      gles_toast("NEUE EPISODE", TOAST_BLUE);
     }
 
     if (!g_paused.load()) {

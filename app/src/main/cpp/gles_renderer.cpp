@@ -26,10 +26,9 @@ static void text_quads(std::vector<float>& v, const char* s, float x0,
 static float text_width(const char* s, float scale);
 // shared bottom-bar button layout (defined in the touch-buttons section)
 void ui_button_rect(int i, float r[4]);
-// v1.3.0 overlay windows (NN info + motion manager)
+// v1.3.0/1.4.0 overlay windows (NN info + motion manager)
 static void ui_window_rect(int which, float r[4]);
 static bool ui_window_button_rect(int win, int btn, float r[4]);
-static void gles_render_windows();
 
 // UI/diag state — written by input + loop threads, read by the view thread.
 // Guarded by one small mutex; contention is negligible (few writes/cycle).
@@ -114,6 +113,74 @@ void gles_toggle_window(int which) {
 bool gles_window_open(int which) {
   return (which >= 0 && which < WIN_COUNT) ? g_win_open[which].load() : false;
 }
+
+// ---------------- v1.4.0 UI-redesign state (pressed / toast / pip / confirm) ---
+static std::atomic<int> g_pressed_btn{-1};   // bottom-bar button pressed (-1 none)
+static std::atomic<int> g_pressed_wb{-1};    // window-button id pressed (-1 none)
+static std::atomic<bool> g_pip_big{false};   // robot camera tapped large
+
+void gles_set_pressed(int btn) { g_pressed_btn.store(btn); }
+void gles_set_pressed_wb(int id) { g_pressed_wb.store(id); }
+
+static std::mutex g_toast_mtx;
+static char g_toast_msg[48] = {0};
+static double g_toast_t0 = -1.0;             // start time (s, CLOCK_MONOTONIC)
+static double g_toast_dur = 2.2;
+static int g_toast_col = TOAST_GRAY;
+
+static double now_sec() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
+
+void gles_toast(const char* msg, int color) {
+  std::lock_guard<std::mutex> lk(g_toast_mtx);
+  snprintf(g_toast_msg, sizeof g_toast_msg, "%s", msg ? msg : "");
+  g_toast_t0 = now_sec();
+  g_toast_dur = 2.2;
+  g_toast_col = color;
+}
+
+// two-step confirm for LOESCH (armed for 3 s, auto-expires)
+static std::atomic<long> g_confirm_t0{0};    // 0 = disarmed, else ms epoch
+void gles_mot_arm_confirm() { g_confirm_t0.store((long)(now_sec() * 1000.0)); }
+void gles_mot_disarm() { g_confirm_t0.store(0); }
+bool gles_mot_confirm_armed() {
+  const long t0 = g_confirm_t0.load();
+  if (t0 <= 0) return false;
+  if ((long)(now_sec() * 1000.0) - t0 > 3000) {  // expired
+    g_confirm_t0.store(0);
+    return false;
+  }
+  return true;
+}
+
+// ---------------- v1.4.0 design system: palette + icons ----------------
+// One accent palette for buttons, chips, bars and toasts — everything that
+// carries meaning uses the same color, so the screen reads at a glance.
+static const float kAcc[8][3] = {
+    {0.24f, 0.80f, 0.44f},  // 0 green  (run / ok)
+    {0.98f, 0.72f, 0.18f},  // 1 amber  (pause / tight budget)
+    {0.94f, 0.32f, 0.28f},  // 2 red    (stop / error / delete)
+    {0.32f, 0.60f, 0.97f},  // 3 blue   (new episode / info)
+    {0.66f, 0.46f, 0.95f},  // 4 violet (neural net)
+    {0.14f, 0.72f, 0.65f},  // 5 teal   (motion manager)
+    {0.95f, 0.56f, 0.18f},  // 6 orange (finetune)
+    {0.64f, 0.68f, 0.74f}}; // 7 gray   (neutral diag)
+
+// 7x7 pixel icons, one byte per row, bit 6 = leftmost column
+enum PcsIcon {
+  IC_PLAY = 0, IC_PAUSE, IC_STOP, IC_BOLT, IC_PLUS, IC_CHIP, IC_BARS, IC_COUNT
+};
+static const uint8_t kIcons[IC_COUNT][7] = {
+    {0x40, 0x60, 0x70, 0x78, 0x70, 0x60, 0x40},  // play   (triangle right)
+    {0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66},  // pause  (two bars)
+    {0x00, 0x1E, 0x1E, 0x1E, 0x1E, 0x1E, 0x00},  // stop   (square)
+    {0x06, 0x0C, 0x18, 0x3E, 0x0C, 0x18, 0x30},  // bolt   (finetune)
+    {0x08, 0x08, 0x08, 0x3E, 0x08, 0x08, 0x08},  // plus   (new episode)
+    {0x08, 0x3E, 0x22, 0x2A, 0x22, 0x3E, 0x08},  // chip   (NN)
+    {0x7C, 0x00, 0x3C, 0x00, 0x1C, 0x00, 0x00}}; // bars   (motion clips)
 
 static PcsNnState g_nn;
 static PcsMotState g_mot;
@@ -272,6 +339,338 @@ static GLint g_uMVP = -1, g_uModel = -1, g_uColor = -1;
 static GLint g_aPos = -1, g_aNrm = -1;
 static GLint g_huColor = -1, g_huPos = -1;
 static int g_win_w = 1, g_win_h = 1;
+
+// ---- v1.4.0 UI program: rounded rects via SDF, per-vertex color ----
+// Each quad carries: NDC pos, local coords (-1..1), rect (cx,cy,hw,hh in
+// pixels), RGBA color, and (radius_px, border_px). border>0 draws only a
+// ring of that width; radius 0 = sharp rect. This gives the whole UI real
+// rounded corners + per-element colors in ONE draw call.
+static const char* kUiVS =
+    "attribute vec2 aPos;\n"
+    "attribute vec2 aLocal;\n"
+    "attribute vec4 aRect;\n"
+    "attribute vec4 aCol;\n"
+    "attribute vec2 aMod;\n"
+    "varying vec2 vLocal;\n"
+    "varying vec4 vRect;\n"
+    "varying vec4 vCol;\n"
+    "varying vec2 vMod;\n"
+    "void main(){ vLocal = aLocal * aRect.zw; vRect = aRect; vCol = aCol;\n"
+    "  vMod = aMod; gl_Position = vec4(aPos, 0.0, 1.0); }";
+static const char* kUiFS =
+#ifdef PCS_DESKTOP
+    "varying vec2 vLocal;\n"
+    "varying vec4 vRect;\n"
+    "varying vec4 vCol;\n"
+    "varying vec2 vMod;\n"
+#else
+    "precision mediump float;\n"
+    "varying vec2 vLocal;\n"
+    "varying vec4 vRect;\n"
+    "varying vec4 vCol;\n"
+    "varying vec2 vMod;\n"
+#endif
+    "void main(){\n"
+    "  vec2 h = max(vRect.zw - vec2(vMod.x), vec2(0.0));\n"
+    "  vec2 d = abs(vLocal) - h;\n"
+    "  float dist = length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0)\n"
+    "             - vMod.x;\n"
+    "  float a;\n"
+    "  if (vMod.y > 0.0) a = 1.0 - smoothstep(vMod.y - 1.0, vMod.y + 1.0,\n"
+    "                                         abs(dist));\n"
+    "  else a = 1.0 - smoothstep(-1.0, 1.0, dist);\n"
+    "  if (a <= 0.004) discard;\n"
+    "  gl_FragColor = vec4(vCol.rgb, vCol.a * a); }";
+
+static GLuint g_ui_prog = 0;
+static GLint g_uiPos = -1, g_uiLocal = -1, g_uiRect = -1, g_uiCol = -1,
+             g_uiMod = -1;
+static GLuint g_ui_vbo = 0;
+
+// one rounded rect = 6 vertices x 14 floats (pos2 local2 rect4 col4 mod2)
+static void ui_rect(std::vector<float>& v, const float r[4], float cr, float cg,
+                    float cb, float ca, float radius, float border, int W,
+                    int H) {
+  const float hw = 0.5f * (r[2] - r[0]), hh = 0.5f * (r[3] - r[1]);
+  if (hw <= 0.5f || hh <= 0.5f) return;
+  const float cx = 0.5f * (r[0] + r[2]), cy = 0.5f * (r[1] + r[3]);
+  const float xa = 2.f * r[0] / W - 1.f, xb = 2.f * r[2] / W - 1.f;
+  const float ya = 1.f - 2.f * r[1] / H, yb = 1.f - 2.f * r[3] / H;
+  static const float L[6][2] = {{-1, -1}, {1, -1}, {1, 1},
+                                {-1, -1}, {1, 1},  {-1, 1}};
+  const float Q[6][2] = {{xa, ya}, {xb, ya}, {xb, yb},
+                         {xa, ya}, {xb, yb}, {xa, yb}};
+  for (int i = 0; i < 6; ++i) {
+    v.push_back(Q[i][0]); v.push_back(Q[i][1]);
+    v.push_back(L[i][0]); v.push_back(L[i][1]);
+    v.push_back(cx); v.push_back(cy); v.push_back(hw); v.push_back(hh);
+    v.push_back(cr); v.push_back(cg); v.push_back(cb); v.push_back(ca);
+    v.push_back(radius); v.push_back(border);
+  }
+}
+
+// draw a batch of UI quads (stream buffer, one call)
+static void ui_draw(GLuint vbo, const std::vector<float>& v) {
+  if (v.empty() || g_ui_prog == 0) return;
+  glBindBuffer(GL_ARRAY_BUFFER, vbo);
+  glBufferData(GL_ARRAY_BUFFER, v.size() * sizeof(float), v.data(),
+               GL_STREAM_DRAW);
+  const GLint locs[5] = {g_uiPos, g_uiLocal, g_uiRect, g_uiCol, g_uiMod};
+  const GLint sizes[5] = {2, 2, 4, 4, 2};
+  uintptr_t off = 0;
+  for (int i = 0; i < 5; ++i) {
+    glEnableVertexAttribArray((GLuint)locs[i]);
+    glVertexAttribPointer((GLuint)locs[i], sizes[i], GL_FLOAT, GL_FALSE, 56,
+                          (void*)off);
+    off += (uintptr_t)sizes[i] * 4;
+  }
+  glDrawArrays(GL_TRIANGLES, 0, (GLint)(v.size() / 14));
+  for (int i = 0; i < 5; ++i) glDisableVertexAttribArray((GLuint)locs[i]);
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+// ---------------- v1.4.0 helpers (layout + icons + bars) ----------------
+// ONE source of truth per element: draw and hit-test both call the same
+// ui_*_rect function, so what you see is exactly what you touch.
+
+static float g_fps = 0.f;            // view-thread FPS (EMA), for the chip
+static double g_last_frame = -1.0;
+
+void gles_pip_set_big(bool big) { g_pip_big.store(big); }
+bool gles_pip_big() { return g_pip_big.load(); }
+
+// 7x7 icon as colored quads (flat HUD program, accent color batch)
+static void icon_quads(std::vector<float>& v, int icon, float x0, float y0,
+                       float cs, int W, int H) {
+  if (icon < 0 || icon >= IC_COUNT) return;
+  for (int r = 0; r < 7; ++r) {
+    for (int c = 0; c < 7; ++c) {
+      if (!((kIcons[icon][r] >> (6 - c)) & 1)) continue;
+      const float px = x0 + c * cs, py = y0 + r * cs;
+      const float xa = 2.f * px / W - 1.f, xb = 2.f * (px + cs) / W - 1.f;
+      const float ya = 1.f - 2.f * py / H, yb = 1.f - 2.f * (py + cs) / H;
+      v.insert(v.end(), {xa, ya, xb, ya, xb, yb});
+      v.insert(v.end(), {xa, ya, xb, yb, xa, yb});
+    }
+  }
+}
+
+// ---- layout rects ----
+static void ui_status_rect(float r[4]) {
+  const int W = g_win_w, H = g_win_h;
+  r[0] = 0.014f * W; r[1] = 0.016f * H;
+  r[2] = r[0] + 0.302f * W;
+  r[3] = r[1] + 0.138f * H;
+}
+static void ui_chip_rect(int i, float r[4]) {   // 0 FPS, 1 MS, 2 DIAG
+  const int W = g_win_w, H = g_win_h;
+  static const float kW[3] = {0.068f, 0.078f, 0.058f};
+  float x = 0.328f * W;
+  for (int k = 0; k < i; ++k) x += kW[k] * W + 0.008f * W;
+  r[0] = x; r[1] = 0.016f * H;
+  r[2] = x + kW[i] * W; r[3] = r[1] + 0.050f * H;
+}
+static void ui_pip_rect(float r[4]) {
+  const int W = g_win_w, H = g_win_h;
+  const float ph = (g_pip_big.load() ? 0.56f : 0.295f) * H;
+  const float pw = ph * 4.f / 3.f;              // source is 96x72
+  const float x1 = W - 0.014f * W;
+  const float y0 = 0.055f * H;
+  r[2] = x1; r[0] = x1 - pw;
+  r[1] = y0; r[3] = y0 + ph;
+}
+bool gles_hit_pip(float x, float y) {
+  float r[4];
+  ui_pip_rect(r);
+  return x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3];
+}
+
+// horizontal bar: dark track + accent fill (rounded, reads instantly)
+static void ui_bar(std::vector<float>& v, float x0, float y0, float w, float h,
+                   float frac, int col, int W, int H) {
+  float bg[4] = {x0, y0, x0 + w, y0 + h};
+  ui_rect(v, bg, 0.f, 0.f, 0.f, 0.38f, h * 0.5f, 0.f, W, H);
+  if (frac > 0.004f) {
+    float fg[4] = {x0, y0, x0 + w * std::min(1.f, frac), y0 + h};
+    const float* c = kAcc[col & 7];
+    ui_rect(v, fg, c[0], c[1], c[2], 0.95f, h * 0.5f, 0.f, W, H);
+  }
+}
+
+// window content: rounded rects (close button, action buttons, live bars)
+// rows are laid out identically in ui_render_window_text below
+static void ui_render_window_bars(std::vector<float>& ui, int win,
+                                  const float wr[4], int W, int H,
+                                  double tnow) {
+  const float s2 = std::max(3.f, H / 150.f);
+  const float lh = 6.5f * s2;
+  const float pad = 0.012f * W;
+  const int pressed_wb = g_pressed_wb.load();
+
+  // close button (top-right, red square, brightens when pressed)
+  {
+    float r[4];
+    if (ui_window_button_rect(win, 0, r)) {
+      float br = (pressed_wb == 0) ? 1.35f : 1.f;
+      ui_rect(ui, r, std::min(1.f, 0.94f * br), std::min(1.f, 0.32f * br),
+              std::min(1.f, 0.28f * br), 0.95f, 0.008f * W, 0.f, W, H);
+    }
+  }
+
+  if (win == WIN_NN) {
+    // KAM reset button (bottom row, slate + violet border)
+    float r[4];
+    if (ui_window_button_rect(win, 1, r)) {
+      const float br = (pressed_wb == 1) ? 1.35f : 1.f;
+      ui_rect(ui, r, std::min(1.f, 0.24f * br), std::min(1.f, 0.26f * br),
+              std::min(1.f, 0.34f * br), 0.95f, 0.010f * W, 0.f, W, H);
+    }
+    // live bars rows 5..8 (labels EMB / FEP / MOE / ETA)
+    const float bx0 = wr[0] + 0.082f * W, bx1 = wr[2] - 0.115f * W;
+    const float bh = 2.6f * s2;
+    for (int i = 0; i < 4; ++i) {
+      const float cy = wr[1] + 0.042f * H + (5 + i) * lh + 2.5f * s2;
+      float frac = 0.f;
+      int col = TOAST_VIOLET;
+      if (i == 0) frac = g_nn.emb_norm / 2.0f;
+      if (i == 1) { frac = g_nn.free_energy * 8.f; col = TOAST_AMBER; }
+      if (i == 2) frac = g_nn.moe_max;
+      if (i == 3) { frac = g_nn.lora_eta / 0.5f; col = TOAST_ORANGE; }
+      ui_bar(ui, bx0, cy - bh * 0.5f, bx1 - bx0, bh, frac, col, W, H);
+    }
+  } else {
+    // MOT: status blink dot (row 0)
+    bool rec = g_mot.rec_left > 0, train = g_mot.train_left > 0;
+    if (rec || train) {
+      const bool on = sinf((float)(tnow * 6.0)) > -0.2f;
+      if (on) {
+        const float dr = 1.6f * s2;
+        float dot[4] = {wr[0] + pad, wr[1] + 0.042f * H + 1.0f * s2,
+                        wr[0] + pad + 2 * dr, wr[1] + 0.042f * H + 1.0f * s2 + 2 * dr};
+        const float* c = kAcc[rec ? TOAST_RED : TOAST_ORANGE];
+        ui_rect(ui, dot, c[0], c[1], c[2], 0.95f, dr, 0.f, W, H);
+      }
+    }
+    // countdown bar (row 5)
+    {
+      const float bx0 = wr[0] + pad, bx1 = wr[2] - pad;
+      const float cy = wr[1] + 0.042f * H + 5 * lh + 2.5f * s2;
+      const float bh = 2.6f * s2;
+      float frac = 0.f;
+      int col = TOAST_TEAL;
+      if (rec) { frac = (float)g_mot.rec_left / 250.f; col = TOAST_RED; }
+      else if (train) { frac = (float)g_mot.train_left / 64.f; col = TOAST_ORANGE; }
+      ui_bar(ui, bx0, cy - bh * 0.5f, bx1 - bx0, bh, frac, col, W, H);
+    }
+    // 4 action buttons (bottom row): AUFZ / UMW / TRAIN / LOESCH
+    static const int kMotCol[4] = {TOAST_RED, TOAST_BLUE, TOAST_ORANGE,
+                                   TOAST_GRAY};
+    const bool armed = gles_mot_confirm_armed();
+    for (int b = 1; b <= 4; ++b) {
+      float r[4];
+      if (!ui_window_button_rect(win, b, r)) continue;
+      int col = kMotCol[b - 1];
+      if (b == 4 && armed) col = TOAST_RED;  // armed confirm = red
+      const float br = (pressed_wb == b) ? 1.35f : 1.f;
+      const float* c = kAcc[col];
+      ui_rect(ui, r, std::min(1.f, c[0] * br), std::min(1.f, c[1] * br),
+              std::min(1.f, c[2] * br), 0.95f, 0.010f * W, 0.f, W, H);
+    }
+  }
+}
+
+// window content text (rows match ui_render_window_bars)
+static void ui_render_window_text(int win, const float wr[4], int W, int H,
+                                  float s, float s2, std::vector<float>& t_white,
+                                  std::vector<float>& t_gray,
+                                  std::vector<float> t_acc[8], double tnow) {
+  (void)tnow;
+  const float lh = 6.5f * s2;
+  const float pad = 0.014f * W;
+  const float tx0 = wr[0] + pad + 0.004f * W;  // clear of the accent strip
+  // title
+  text_quads(t_white, win == WIN_NN ? "NEURONALES NETZ - 100 HZ"
+                                    : "MOTION-MANAGER",
+             tx0, wr[1] + 0.010f * H, s2, W, H);
+  // close X
+  {
+    float r[4];
+    if (ui_window_button_rect(win, 0, r)) {
+      const float tw = text_width("X", s2);
+      text_quads(t_white, "X", (r[0] + r[2]) * 0.5f - tw * 0.5f,
+                 (r[1] + r[3]) * 0.5f - 2.5f * s2, s2, W, H);
+    }
+  }
+  auto row_y = [&](int i) { return wr[1] + 0.042f * H + i * lh + 0.8f * s2; };
+
+  if (win == WIN_NN) {
+    static const char* kArch[3] = {
+        "EVENT 96X72 - 576 BINS - LSNN 128",
+        "FEP 32D - SOFT-MOE 8 - MLP 24-8-8",
+        "LORA R4 + LYAPUNOV-REGELUNG"};
+    for (int i = 0; i < 3; ++i) text_quads(t_gray, kArch[i], tx0, row_y(i), s2, W, H);
+    char l[48];
+    snprintf(l, sizeof l, "EVENTS %u  SPIKES %u", g_nn.events, g_nn.spikes);
+    text_quads(t_white, l, tx0, row_y(4), s2, W, H);
+    snprintf(l, sizeof l, "V %.4f", g_nn.lora_v);
+    const float vw = text_width(l, s2);
+    text_quads(t_white, l, wr[2] - pad - vw, row_y(4), s2, W, H);
+    // bar rows: label left, value right (bars drawn in _bars)
+    struct BarRow { const char* lbl; char buf[24]; };
+    char b0[24], b1[24], b2[24], b3[24];
+    snprintf(b0, sizeof b0, "%.3f", g_nn.emb_norm);
+    snprintf(b1, sizeof b1, "%.4f", g_nn.free_energy);
+    snprintf(b2, sizeof b2, "%.2f", g_nn.moe_max);
+    snprintf(b3, sizeof b3, "%.3f", g_nn.lora_eta);
+    const char* lbls[4] = {"EMB", "FEP", "MOE", "ETA"};
+    const char* vals[4] = {b0, b1, b2, b3};
+    for (int i = 0; i < 4; ++i) {
+      const float ry = row_y(5 + i);
+      text_quads(t_gray, lbls[i], tx0, ry, s2, W, H);
+      const float vw2 = text_width(vals[i], s2);
+      text_quads(t_white, vals[i], wr[2] - pad - vw2, ry, s2, W, H);
+    }
+    snprintf(l, sizeof l, "PHYS %u  EV %u  SNN %u  MLP %u US", g_nn.t_phys,
+             g_nn.t_event, g_nn.t_snn, g_nn.t_mlp);
+    text_quads(t_gray, l, tx0, row_y(10), s2, W, H);
+  } else {
+    // status row (dot drawn in _bars)
+    const char* st = "BEREIT";
+    int stc = TOAST_TEAL;
+    if (g_mot.rec_left > 0) { st = "AUFNAHME..."; stc = TOAST_RED; }
+    else if (g_mot.train_left > 0) { st = "TRAINING..."; stc = TOAST_ORANGE; }
+    text_quads(t_acc[stc], st, tx0 + 3.4f * s2, row_y(0), s2, W, H);
+    char l[48];
+    snprintf(l, sizeof l, "CLIPS %d - SAMPLES %d", g_mot.clips, g_mot.samples);
+    text_quads(t_white, l, tx0, row_y(1), s2, W, H);
+    snprintf(l, sizeof l, "UPDATES %d - NORM %.2f", g_mot.updates,
+             g_mot.last_feat_norm);
+    text_quads(t_white, l, tx0, row_y(2), s2, W, H);
+    snprintf(l, sizeof l, "MSG: %s", g_mot.msg[0] ? g_mot.msg : "-");
+    text_quads(t_gray, l, tx0, row_y(4), s2, W, H);
+    // button labels
+    static const char* kMotLbl[4] = {"AUFZ", "UMW", "TRAIN", "LOESCH"};
+    const bool armed = gles_mot_confirm_armed();
+    for (int b = 1; b <= 4; ++b) {
+      float r[4];
+      if (!ui_window_button_rect(win, b, r)) continue;
+      const char* lbl = (b == 4 && armed) ? "SICHER?" : kMotLbl[b - 1];
+      const float tw = text_width(lbl, s2);
+      text_quads(t_white, lbl, (r[0] + r[2]) * 0.5f - tw * 0.5f,
+                 (r[1] + r[3]) * 0.5f - 2.5f * s2, s2, W, H);
+    }
+  }
+  // KAM button label (NN only)
+  if (win == WIN_NN) {
+    float r[4];
+    if (ui_window_button_rect(win, 1, r)) {
+      const float tw = text_width("KAMERA ZURUECKSETZEN", s2);
+      text_quads(t_white, "KAMERA ZURUECKSETZEN",
+                 (r[0] + r[2]) * 0.5f - tw * 0.5f,
+                 (r[1] + r[3]) * 0.5f - 2.5f * s2, s2, W, H);
+    }
+  }
+}
 
 // cube geometry (unit cube, 24 verts with normals)
 static GLuint g_cube_vbo = 0;
@@ -506,6 +905,15 @@ void gles_init(SimGlue& glue, int win_w, int win_h) {
   g_huColor = glGetUniformLocation(g_hud_prog, "uColor");
   g_huPos = glGetAttribLocation(g_hud_prog, "aPos");
 
+  // v1.4.0: rounded-rect UI program (panels, buttons, bars, toasts)
+  g_ui_prog = make_program(kUiVS, kUiFS);
+  g_uiPos = glGetAttribLocation(g_ui_prog, "aPos");
+  g_uiLocal = glGetAttribLocation(g_ui_prog, "aLocal");
+  g_uiRect = glGetAttribLocation(g_ui_prog, "aRect");
+  g_uiCol = glGetAttribLocation(g_ui_prog, "aCol");
+  g_uiMod = glGetAttribLocation(g_ui_prog, "aMod");
+  if (g_ui_vbo == 0) glGenBuffers(1, &g_ui_vbo);
+
   std::vector<float> v;
   push_cube(v);
   glGenBuffers(1, &g_cube_vbo);
@@ -649,6 +1057,17 @@ void gles_render_view(SimGlue& glue, Controller& ctrl) {
   // frame-stable snapshot of the window size (the activity thread may resize
   // g_win_w/h at any moment — mixing sizes within one frame jitters the image)
   const int W = g_win_w, H = g_win_h;
+  // v1.4.0: FPS estimate for the perf chip (EMA of frame deltas)
+  {
+    const double t = now_sec();
+    if (g_last_frame > 0.0) {
+      const double dt = t - g_last_frame;
+      if (dt > 0.0005 && dt < 0.5)
+        g_fps = g_fps <= 0.5f ? (float)(1.0 / dt)
+                              : g_fps * 0.9f + (float)(1.0 / dt) * 0.1f;
+    }
+    g_last_frame = t;
+  }
   std::vector<float> pos, quat;
   copy_poses(pos, quat);
   const bool have_poses = pos.size() >= (size_t)3 * m->nbody;
@@ -715,126 +1134,317 @@ void gles_render_view(SimGlue& glue, Controller& ctrl) {
 
 void gles_render_hud(const CycleStats& st, const TaskOutput& task) {
   (void)task;
-  if (g_huPos < 0 || g_hud_prog == 0) return;
+  if (g_huPos < 0 || g_hud_prog == 0 || g_ui_prog == 0) return;
   const int W = g_win_w, H = g_win_h;
+  const float s = std::max(3.f, H / 95.f);    // main text scale
+  const float s2 = std::max(3.f, H / 150.f);  // small text scale
+  const double tnow = now_sec();
 
+  // one-time camera-gesture hint (renderer-side, no loop changes needed)
+  static bool s_hint = false;
+  if (!s_hint) {
+    s_hint = true;
+    gles_toast("1 FINGER DREHEN - 2 FINGER ZOOM", TOAST_BLUE);
+  }
+
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+  // ================= pass 1: rounded-rect UI (one draw call) =================
+  std::vector<float> ui;
+
+  // ---- cycle-budget strip along the top edge ----
+  {
+    const float frac = std::min(1.0f, (float)st.t_total / 10000.f);
+    float r[4] = {0.f, 0.f, W * frac, std::max(4.f, 0.005f * H)};
+    const float* c = st.t_total > 10000 ? kAcc[TOAST_RED]
+                    : st.t_total > 8000 ? kAcc[TOAST_AMBER]
+                                        : kAcc[TOAST_GREEN];
+    ui_rect(ui, r, c[0], c[1], c[2], 0.95f, 2.f, 0.f, W, H);
+  }
+
+  // ---- status card (top left) ----
+  float card[4];
+  ui_status_rect(card);
+  ui_rect(ui, card, 0.095f, 0.105f, 0.135f, 0.82f, 0.012f * W, 0.f, W, H);
+  ui_rect(ui, card, 1.f, 1.f, 1.f, 0.07f, 0.012f * W, 1.2f, W, H);  // hairline
+  {
+    // row 1: state dot + state + phase (right)
+    const bool blink = (sinf((float)(tnow * 8.0)) > 0.f);
+    int scol = TOAST_GREEN;
+    const char* sname = "AKTIV";
+    if (g_diag.paused) { scol = TOAST_AMBER; sname = "PAUSIERT"; }
+    else if (g_diag.halted) { scol = TOAST_RED; sname = "HALT"; }
+    else if (g_diag.finetuning) { scol = TOAST_ORANGE; sname = "FINETUNE"; }
+    const float dotR = 0.0045f * W;
+    float dot[4] = {card[0] + 0.012f * W, card[1] + 0.020f * H,
+                    card[0] + 0.012f * W + 2 * dotR, card[1] + 0.020f * H + 2 * dotR};
+    const float* dc = kAcc[scol];
+    const float dalpha = g_diag.finetuning ? (blink ? 1.f : 0.35f) : 1.f;
+    ui_rect(ui, dot, dc[0], dc[1], dc[2], dalpha, dotR, 0.f, W, H);
+    // row 2: progress bar + counts
+    const float bx0 = card[0] + 0.095f * W, bx1 = card[2] - 0.060f * W;
+    const float frac = g_diag.total > 0
+                           ? (float)g_diag.sorted / (float)g_diag.total : 0.f;
+    ui_bar(ui, bx0, card[1] + 0.062f * H, bx1 - bx0, 0.020f * H, frac,
+           TOAST_GREEN, W, H);
+    // row 3: mini stacked bar (stacked = sorted placed on zones)
+    const float sfrac = g_diag.total > 0
+                            ? (float)g_diag.stacked / (float)g_diag.total : 0.f;
+    ui_bar(ui, bx0, card[1] + 0.098f * H, bx1 - bx0, 0.014f * H, sfrac,
+           TOAST_BLUE, W, H);
+  }
+
+  // ---- perf chips (right of the card) ----
+  for (int i = 0; i < 3; ++i) {
+    float r[4];
+    ui_chip_rect(i, r);
+    ui_rect(ui, r, 0.095f, 0.105f, 0.135f, 0.72f, 0.45f * (r[3] - r[1]), 0.f,
+            W, H);
+  }
+
+  // ---- action bar (bottom): color-coded buttons ----
+  static const int kBtnCol[BTN_COUNT] = {TOAST_GREEN, TOAST_RED, TOAST_ORANGE,
+                                         TOAST_BLUE, TOAST_VIOLET, TOAST_TEAL};
+  static const int kBtnIcon[BTN_COUNT] = {IC_PLAY, IC_STOP, IC_BOLT, IC_PLUS,
+                                          IC_CHIP, IC_BARS};
+  const int pressed = g_pressed_btn.load();
+  for (int i = 0; i < BTN_COUNT; ++i) {
+    float r[4];
+    ui_button_rect(i, r);
+    int col = kBtnCol[i];
+    if (i == BTN_START) col = g_diag.paused ? TOAST_GREEN : TOAST_AMBER;
+    float br = 1.f;
+    if (i == BTN_FINE && g_diag.finetuning) br = 1.f + 0.35f * (sinf((float)(tnow * 9.0)) * 0.5f + 0.5f);
+    if (i == pressed) {  // pressed: shrink + brighten
+      const float cx = 0.5f * (r[0] + r[2]), cy = 0.5f * (r[1] + r[3]);
+      r[0] = cx + (r[0] - cx) * 0.94f; r[2] = cx + (r[2] - cx) * 0.94f;
+      r[1] = cy + (r[1] - cy) * 0.94f; r[3] = cy + (r[3] - cy) * 0.94f;
+      br *= 1.35f;
+    }
+    if ((i == BTN_NN && gles_window_open(WIN_NN)) ||
+        (i == BTN_MOT && gles_window_open(WIN_MOT)))
+      br *= 1.2f;  // toggle buttons look "in" while their window is open
+    const float* c = kAcc[col];
+    ui_rect(ui, r, std::min(1.f, c[0] * br), std::min(1.f, c[1] * br),
+            std::min(1.f, c[2] * br), 0.92f, 0.012f * W, 0.f, W, H);
+    if ((i == BTN_NN && gles_window_open(WIN_NN)) ||
+        (i == BTN_MOT && gles_window_open(WIN_MOT))) {
+      float rr[4];
+      ui_button_rect(i, rr);
+      float dot[4] = {rr[2] - 0.009f * W, rr[1] + 0.008f * H, rr[2] - 0.004f * W,
+                      rr[1] + 0.016f * H};
+      ui_rect(ui, dot, 1.f, 1.f, 1.f, 0.95f, 0.0025f * W, 0.f, W, H);
+    }
+  }
+
+  // ================= windows (panels + bars, still pass 1) =================
+  const bool open_nn = gles_window_open(WIN_NN);
+  const bool open_mot = gles_window_open(WIN_MOT);
+  float wr[4] = {0};
+  int wopen = -1;
+  if (open_nn) { ui_window_rect(WIN_NN, wr); wopen = WIN_NN; }
+  else if (open_mot) { ui_window_rect(WIN_MOT, wr); wopen = WIN_MOT; }
+  if (wopen >= 0) {
+    ui_rect(ui, wr, 0.075f, 0.082f, 0.105f, 0.90f, 0.012f * W, 0.f, W, H);
+    ui_rect(ui, wr, 1.f, 1.f, 1.f, 0.08f, 0.012f * W, 1.2f, W, H);
+    const float* ac = kAcc[wopen == WIN_NN ? TOAST_VIOLET : TOAST_TEAL];
+    float strip[4] = {wr[0], wr[1], wr[0] + 0.006f * W, wr[3]};
+    ui_rect(ui, strip, ac[0], ac[1], ac[2], 0.95f, 0.f, 0.f, W, H);
+    // content bars (NN live values / MOT countdowns) + close button + wbtns
+    ui_render_window_bars(ui, wopen, wr, W, H, tnow);
+  }
+
+  // ================= toast =================
+  char tmsg[48];
+  double tage = -1.0;
+  int tcol = TOAST_GRAY;
+  {
+    std::lock_guard<std::mutex> lk(g_toast_mtx);
+    if (g_toast_t0 > 0) tage = tnow - g_toast_t0;
+    snprintf(tmsg, sizeof tmsg, "%s", g_toast_msg);
+    tcol = g_toast_col;
+  }
+  if (tage >= 0 && tage < g_toast_dur && tmsg[0]) {
+    const float fade = tage < 0.15f ? (float)(tage / 0.15)
+                       : tage > g_toast_dur - 0.4f
+                           ? (float)((g_toast_dur - tage) / 0.4) : 1.f;
+    const float tw = text_width(tmsg, s);
+    const float bh = 0.056f * H;
+    const float pw = tw + 4.5f * s;
+    const float px = 0.5f * (W - pw);
+    const float py = H - 0.115f * H - 0.020f * H - bh - 0.014f * H;
+    float r[4] = {px, py, px + pw, py + bh};
+    const float* c = kAcc[tcol & 7];
+    ui_rect(ui, r, 0.08f, 0.085f, 0.11f, 0.92f * fade, 0.5f * bh, 0.f, W, H);
+    float dot[4] = {px + 0.9f * s, py + 0.5f * (bh - 2 * s), px + 0.9f * s + 2 * s,
+                    py + 0.5f * (bh + 2 * s)};
+    ui_rect(ui, dot, c[0], c[1], c[2], fade, s, 0.f, W, H);
+  }
+
+  glUseProgram(g_ui_prog);
+  ui_draw(g_ui_vbo, ui);
   glUseProgram(g_hud_prog);
 
-  // ---- batch 1: button fills + budget bar (dark, then accent) ----
-  std::vector<float> v;
-  for (int i = 0; i < BTN_COUNT; ++i) {
-    float r[4];
-    ui_button_rect(i, r);
-    const float xa = 2.f * r[0] / W - 1.f, xb = 2.f * r[2] / W - 1.f;
-    const float ya = 1.f - 2.f * r[1] / H, yb = 1.f - 2.f * r[3] / H;
-    v.insert(v.end(), {xa, ya, xb, ya, xb, yb});
-    v.insert(v.end(), {xa, ya, xb, yb, xa, yb});
-  }
-  // cycle-budget bar along the top edge (green ok / amber tight / red over)
-  {
-    const float frac = std::min(1.0f, (float)st.t_total / 10000.f);
-    const bool over = st.t_total > 10000;
-    const float xa = -1.f, xb = -1.f + 2.f * frac;
-    const float ya = 1.f, yb = 1.f - 2.f * std::max(4.f, 0.005f * H) / H;
-    (void)over;
-    v.insert(v.end(), {xa, ya, xb, ya, xb, yb});
-    v.insert(v.end(), {xa, ya, xb, yb, xa, yb});
-  }
-  glUniform4f(g_huColor, 0.13f, 0.14f, 0.16f, 0.92f);
-  stream_draw_2f(g_hud_vbo, g_huPos, v);
+  // ================= pass 2: text + icons (flat, color batches) =============
+  std::vector<float> t_white, t_gray;
+  std::vector<float> t_acc[8];
 
-  // ---- batch 2: accent underline on the START button + bar color ----
-  v.clear();
-  {
-    float r[4];
-    ui_button_rect(BTN_START, r);
-    const float xa = 2.f * r[0] / W - 1.f, xb = 2.f * r[2] / W - 1.f;
-    const float ya = 1.f - 2.f * (r[3] - 0.012f * H) / H, yb = 1.f - 2.f * r[3] / H;
-    v.insert(v.end(), {xa, ya, xb, ya, xb, yb});
-    v.insert(v.end(), {xa, ya, xb, yb, xa, yb});
-    // budget bar recolor pass: draw over with the true color
-    const float frac = std::min(1.0f, (float)st.t_total / 10000.f);
-    const float bxa = -1.f, bxb = -1.f + 2.f * frac;
-    const float bya = 1.f, byb = 1.f - 2.f * std::max(4.f, 0.005f * H) / H;
-    v.insert(v.end(), {bxa, bya, bxb, bya, bxb, byb});
-    v.insert(v.end(), {bxa, bya, bxb, byb, bxa, byb});
-  }
-  glUniform4f(g_huColor, g_diag.paused ? 0.95f : 0.20f,
-              g_diag.paused ? 0.75f : 0.85f, g_diag.paused ? 0.10f : 0.30f,
-              1.f);
-  stream_draw_2f(g_hud_vbo, g_huPos, v);
-
-  // ---- batch 3: white text (labels, diag, counters) ----
-  const float s = std::max(3.f, H / 90.f);  // glyph pixel scale
-  v.clear();
+  // ---- button icons + labels ----
   static const char* kLabels[BTN_COUNT] = {"START", "STOP", "FINE", "NEU",
                                            "NN", "MOT"};
-  for (int i = 0; i < BTN_COUNT; ++i) {
-    float r[4];
-    ui_button_rect(i, r);
-    const char* lbl = kLabels[i];
-    if (i == BTN_START) lbl = g_diag.paused ? "START" : "PAUSE";
-    if (i == BTN_NN && gles_window_open(WIN_NN)) lbl = "NN X";
-    if (i == BTN_MOT && gles_window_open(WIN_MOT)) lbl = "MOT X";
-    const float tw = text_width(lbl, s);
-    text_quads(v, lbl, (r[0] + r[2]) * 0.5f - tw * 0.5f,
-               (r[1] + r[3]) * 0.5f - 2.5f * s, s, W, H);
+  {
+    const float cs = std::max(3.f, H / 190.f);
+    for (int i = 0; i < BTN_COUNT; ++i) {
+      float r[4];
+      ui_button_rect(i, r);
+      const int col = (i == BTN_START) ? (g_diag.paused ? TOAST_GREEN
+                                                        : TOAST_AMBER)
+                                       : kBtnCol[i];
+      const int icon = (i == BTN_START) ? (g_diag.paused ? IC_PLAY : IC_PAUSE)
+                                        : kBtnIcon[i];
+      const char* lbl = kLabels[i];
+      if (i == BTN_START) lbl = g_diag.paused ? "START" : "PAUSE";
+      const float ih = 7.f * cs, th = 5.f * s;
+      const float iy = r[1] + 0.10f * (r[3] - r[1]);
+      const float iw = 7.f * cs;
+      icon_quads(t_acc[col], icon, (r[0] + r[2]) * 0.5f - iw * 0.5f, iy, cs,
+                 W, H);
+      const float tw = text_width(lbl, s);
+      text_quads(t_acc[col], lbl, (r[0] + r[2]) * 0.5f - tw * 0.5f,
+                 iy + ih + 0.14f * (r[3] - r[1]), s, W, H);
+    }
   }
-  // diagnostics top-left (visible WITHOUT adb)
-  char l1[48], l2[48];
-  snprintf(l1, sizeof l1, "SORTIERT %d/%d GESTAPELT %d", g_diag.sorted,
-           g_diag.total, g_diag.stacked);
-  const char* mode = g_diag.finetuning
-                         ? "FINE"
-                         : g_diag.halted ? "HALT"
-                                         : (g_diag.paused ? "PAUSE" : "AKTIV");
-  snprintf(l2, sizeof l2, "ZYK %ld B%d G%d %s", g_diag.cycles, g_diag.bind,
-           g_diag.gl_errs, mode);
-  text_quads(v, l1, 0.02f * W, 0.03f * H + 6.f * s, s, W, H);
-  text_quads(v, l2, 0.02f * W, 0.03f * H, s, W, H);
-  glUniform4f(g_huColor, 1.f, 1.f, 1.f, 1.f);
-  stream_draw_2f(g_hud_vbo, g_huPos, v);
 
-  // ---- v1.3.0: overlay windows (NN info / motion manager) ----
-  gles_render_windows();
+  // ---- status card text ----
+  {
+    const float pad = 0.012f * W;
+    int scol = TOAST_GREEN;
+    const char* sname = "AKTIV";
+    if (g_diag.paused) { scol = TOAST_AMBER; sname = "PAUSIERT"; }
+    else if (g_diag.halted) { scol = TOAST_RED; sname = "HALT"; }
+    else if (g_diag.finetuning) { scol = TOAST_ORANGE; sname = "FINETUNE"; }
+    text_quads(t_acc[scol], sname, card[0] + pad + 0.013f * W,
+               card[1] + 0.016f * H, s, W, H);
+    char lbuf[48];
+    snprintf(lbuf, sizeof lbuf, "%s", kPhaseName[task.phase & 7]);
+    const float pw = text_width(lbuf, s2);
+    text_quads(t_gray, lbuf, card[2] - pad - pw, card[1] + 0.021f * H, s2, W, H);
+    snprintf(lbuf, sizeof lbuf, "SORTIERT %d/%d", g_diag.sorted, g_diag.total);
+    text_quads(t_white, lbuf, card[0] + pad, card[1] + 0.058f * H, s2, W, H);
+    snprintf(lbuf, sizeof lbuf, "GESTAPELT %d", g_diag.stacked);
+    text_quads(t_white, lbuf, card[0] + pad, card[1] + 0.094f * H, s2, W, H);
+    snprintf(lbuf, sizeof lbuf, "ZYK %ld", g_diag.cycles);
+    const float cw = text_width(lbuf, s2);
+    text_quads(t_gray, lbuf, card[2] - pad - cw, card[1] + 0.094f * H, s2, W, H);
+  }
+
+  // ---- chips text ----
+  for (int i = 0; i < 3; ++i) {
+    float r[4];
+    ui_chip_rect(i, r);
+    char cb[24];
+    int col = TOAST_GRAY;
+    if (i == 0) {
+      snprintf(cb, sizeof cb, "%.0f FPS", g_fps > 0.5f ? g_fps : 0.f);
+      col = TOAST_GREEN;
+    } else if (i == 1) {
+      snprintf(cb, sizeof cb, "%.1f MS", (float)st.t_total / 1000.f);
+      col = st.t_total > 10000 ? TOAST_RED : st.t_total > 8000 ? TOAST_AMBER
+                                                               : TOAST_GREEN;
+    } else {
+      snprintf(cb, sizeof cb, "B%d G%d", g_diag.bind, g_diag.gl_errs);
+      col = TOAST_GRAY;
+    }
+    const float tw = text_width(cb, s2);
+    text_quads(t_acc[col], cb, (r[0] + r[2]) * 0.5f - tw * 0.5f,
+               (r[1] + r[3]) * 0.5f - 2.5f * s2, s2, W, H);
+  }
+
+  // ---- window text (titles + content) ----
+  if (wopen >= 0) ui_render_window_text(wopen, wr, W, H, s, s2, t_white, t_gray,
+                                        t_acc, tnow);
+
+  // ---- pip label chip ----
+  {
+    float pr[4];
+    ui_pip_rect(pr);
+    const char* lbl = gles_pip_big() ? "KAMERA - TIPPEN ZUM KLEIN" : "KAMERA";
+    const float tw = text_width(lbl, s2);
+    float cr[4] = {pr[0] + 0.006f * W, pr[3] - 0.034f * H,
+                   pr[0] + 0.006f * W + tw + 2.2f * s2, pr[3] - 0.006f * H};
+    ui_rect(ui, cr, 0.06f, 0.065f, 0.085f, 0.85f, 0.006f * W, 0.f, W, H);
+    text_quads(t_gray, lbl, cr[0] + 1.1f * s2, cr[1] + 0.55f * s2, s2, W, H);
+  }
+
+  // ---- toast text ----
+  if (tage >= 0 && tage < g_toast_dur && tmsg[0]) {
+    const float fade = tage < 0.15f ? (float)(tage / 0.15)
+                       : tage > g_toast_dur - 0.4f
+                           ? (float)((g_toast_dur - tage) / 0.4) : 1.f;
+    const float tw = text_width(tmsg, s);
+    const float bh = 0.056f * H;
+    const float pw = tw + 4.5f * s;
+    const float px = 0.5f * (W - pw);
+    const float py = H - 0.115f * H - 0.020f * H - bh - 0.014f * H;
+    text_quads(t_white, tmsg, px + 2.6f * s, py + 0.5f * (bh - 5.f * s), s, W,
+               H);
+    (void)fade;
+  }
+
+  // draw the batches
+  glUniform4f(g_huColor, 0.60f, 0.64f, 0.70f, 1.f);
+  stream_draw_2f(g_hud_vbo, g_huPos, t_gray);
+  for (int c = 0; c < 8; ++c) {
+    if (t_acc[c].empty()) continue;
+    glUniform4f(g_huColor, kAcc[c][0], kAcc[c][1], kAcc[c][2], 1.f);
+    stream_draw_2f(g_hud_vbo, g_huPos, t_acc[c]);
+  }
+  glUniform4f(g_huColor, 1.f, 1.f, 1.f, 1.f);
+  stream_draw_2f(g_hud_vbo, g_huPos, t_white);
+  glDisable(GL_BLEND);
 }
 
 // ---------------- v1.3.0 overlay windows (NN info / motion manager) ----------------
-// Pixel coords are TOP-left origin (same convention as touches + text).
-
-static void push_rect(std::vector<float>& v, const float r[4], int W, int H) {
-  const float xa = 2.f * r[0] / W - 1.f, xb = 2.f * r[2] / W - 1.f;
-  const float ya = 1.f - 2.f * r[1] / H, yb = 1.f - 2.f * r[3] / H;
-  v.insert(v.end(), {xa, ya, xb, ya, xb, yb});
-  v.insert(v.end(), {xa, ya, xb, yb, xa, yb});
-}
+// pixel coords are TOP-left origin (same convention as touches + text)
 
 static void ui_window_rect(int which, float r[4]) {
   const int W = g_win_w, H = g_win_h;
-  const float s2 = std::max(3.f, H / 140.f);
-  const float lh = 6.5f * s2;              // text line height
-  const int lines = (which == WIN_NN) ? 12 : 9;
-  r[0] = 0.02f * W;
-  r[1] = 0.115f * H;
-  r[2] = r[0] + 0.42f * W;
-  r[3] = r[1] + lines * lh + 0.105f * H;   // text + button row + margins
-  if (r[3] > H - 0.155f * H) r[3] = H - 0.155f * H;  // keep above the bar
+  const float s2 = std::max(3.f, H / 150.f);
+  const float lh = 6.5f * s2;
+  const int lines = (which == WIN_NN) ? 11 : 7;
+  r[0] = 0.014f * W;
+  r[1] = 0.170f * H;                       // below the status card
+  r[2] = r[0] + 0.46f * W;
+  r[3] = r[1] + 0.042f * H + lines * lh
+       + (which == WIN_MOT ? 0.092f * H : 0.034f * H);
+  const float maxb = H - 0.152f * H;       // keep above the action bar
+  if (r[3] > maxb) r[3] = maxb;
 }
 
+// window buttons: btn 0 = close (X, top-right); NN btn 1 = KAM (bottom row);
+// MOT btns 1..4 = AUFZ/UMW/TRAIN/LOESCH (bottom row). ids match v1.3.0.
 static bool ui_window_button_rect(int win, int btn, float r[4]) {
-  const int W = g_win_w, H = g_win_h;
-  const int n = (win == WIN_NN) ? 2 : 5;
-  if (btn < 0 || btn >= n) return false;
   float wr[4];
   ui_window_rect(win, wr);
-  const float m = 0.008f * W;
-  const float gap = 0.006f * W;
-  const float bh = 0.052f * H;
+  const int W = g_win_w, H = g_win_h;
+  if (btn == 0) {                          // close: square top-right
+    const float bs = 0.040f * H;
+    r[2] = wr[2] - 0.010f * W;
+    r[0] = r[2] - bs;
+    r[1] = wr[1] + 0.011f * H;
+    r[3] = r[1] + bs;
+    return true;
+  }
+  const int n = (win == WIN_NN) ? 1 : 4;   // bottom-row buttons
+  const int k = btn - 1;
+  if (k < 0 || k >= n) return false;
+  const float m = 0.012f * W, gap = 0.008f * W, bh = 0.056f * H;
   const float bw = ((wr[2] - wr[0]) - 2 * m - (n - 1) * gap) / (float)n;
-  r[0] = wr[0] + m + btn * (bw + gap);
-  r[1] = wr[3] - bh - 0.010f * H;
+  r[0] = wr[0] + m + k * (bw + gap);
   r[2] = r[0] + bw;
-  r[3] = r[1] + bh;
+  r[3] = wr[3] - 0.012f * H;
+  r[1] = r[3] - bh;
   return true;
 }
 
@@ -859,148 +1469,6 @@ int gles_hit_window_button(float x, float y) {
   return 0;
 }
 
-static void gles_render_windows() {
-  const bool open_nn = gles_window_open(WIN_NN);
-  const bool open_mot = gles_window_open(WIN_MOT);
-  if ((!open_nn && !open_mot) || g_hud_prog == 0) return;
-  const int W = g_win_w, H = g_win_h;
-  const float s2 = std::max(3.f, H / 140.f);
-  const float lh = 6.5f * s2;
-
-  // live state snapshot (loop thread publishes under g_ui_mtx)
-  PcsNnState nn;
-  PcsMotState mot;
-  {
-    std::lock_guard<std::mutex> lk(g_ui_mtx);
-    nn = g_nn;
-    mot = g_mot;
-  }
-
-  glUseProgram(g_hud_prog);
-  glEnable(GL_BLEND);
-  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-  // ---- batch A: panels ----
-  std::vector<float> v;
-  float wr_nn[4] = {0}, wr_mot[4] = {0};
-  if (open_nn) { ui_window_rect(WIN_NN, wr_nn); push_rect(v, wr_nn, W, H); }
-  if (open_mot) { ui_window_rect(WIN_MOT, wr_mot); push_rect(v, wr_mot, W, H); }
-  glUniform4f(g_huColor, 0.08f, 0.09f, 0.11f, 0.86f);
-  stream_draw_2f(g_hud_vbo, g_huPos, v);
-
-  // ---- batch B: in-window buttons (slate) + close buttons (red) ----
-  v.clear();
-  for (int w = 0; w < WIN_COUNT; ++w) {
-    if (!(w == WIN_NN ? open_nn : open_mot)) continue;
-    const int n = (w == WIN_NN) ? 2 : 5;
-    for (int b = 0; b < n; ++b) {
-      float r[4];
-      if (!ui_window_button_rect(w, b, r)) continue;
-      if (!((w == WIN_NN && b == 0) || (w == WIN_MOT && b == 0)))
-        push_rect(v, r, W, H);
-    }
-  }
-  glUniform4f(g_huColor, 0.22f, 0.24f, 0.29f, 0.96f);
-  stream_draw_2f(g_hud_vbo, g_huPos, v);
-  v.clear();
-  for (int w = 0; w < WIN_COUNT; ++w) {
-    if (!(w == WIN_NN ? open_nn : open_mot)) continue;
-    float r[4];
-    if (ui_window_button_rect(w, 0, r)) push_rect(v, r, W, H);
-  }
-  glUniform4f(g_huColor, 0.62f, 0.18f, 0.14f, 0.96f);
-  stream_draw_2f(g_hud_vbo, g_huPos, v);
-
-  // ---- batch C: text ----
-  v.clear();
-  static const char* kNnStatic[] = {
-      "EVENT-KAMERA 96X72 - 576 BINS",
-      "ALIF-LSNN: 128 NEURONE ADAPTIV",
-      "FEP-CODER: 32D EMBEDDING",
-      "SOFT-MOE: 8 PROTOTYPEN",
-      "KAN-MLP 24-8-8 + LORA R4 LYAP",
-      "",
-  };
-  if (open_nn) {
-    text_quads(v, "NEURONALES NETZ - 100 HZ", wr_nn[0] + 0.010f * W,
-               wr_nn[1] + 0.012f * H, s2, W, H);
-    float ty = wr_nn[1] + 0.012f * H + 2 * lh;
-    for (const char* l : kNnStatic) {
-      text_quads(v, l, wr_nn[0] + 0.010f * W, ty, s2, W, H);
-      ty += lh;
-    }
-    char ln[48];
-    snprintf(ln, sizeof ln, "EVENTS %u  SPIKES %u", nn.events, nn.spikes);
-    text_quads(v, ln, wr_nn[0] + 0.010f * W, ty, s2, W, H);
-    ty += lh;
-    snprintf(ln, sizeof ln, "EMB %.3f  FEP-E %.4f", nn.emb_norm,
-             nn.free_energy);
-    text_quads(v, ln, wr_nn[0] + 0.010f * W, ty, s2, W, H);
-    ty += lh;
-    snprintf(ln, sizeof ln, "LORA ETA %.3f  V %.4f", nn.lora_eta, nn.lora_v);
-    text_quads(v, ln, wr_nn[0] + 0.010f * W, ty, s2, W, H);
-    ty += lh;
-    snprintf(ln, sizeof ln, "MOE-MAX %.2f  PHASE %s", nn.moe_max,
-             kPhaseName[nn.phase & 7]);
-    text_quads(v, ln, wr_nn[0] + 0.010f * W, ty, s2, W, H);
-    ty += lh;
-    snprintf(ln, sizeof ln, "T US: P%u E%u S%u M%u", nn.t_phys, nn.t_event,
-             nn.t_snn, nn.t_mlp);
-    text_quads(v, ln, wr_nn[0] + 0.010f * W, ty, s2, W, H);
-  }
-  if (open_mot) {
-    text_quads(v, "MOTION-MANAGER", wr_mot[0] + 0.010f * W,
-               wr_mot[1] + 0.012f * H, s2, W, H);
-    float ty = wr_mot[1] + 0.012f * H + 2 * lh;
-    char ln[48];
-    text_quads(v, mot.msg[0] ? mot.msg : "BEREIT", wr_mot[0] + 0.010f * W, ty,
-               s2, W, H);
-    ty += lh;
-    snprintf(ln, sizeof ln, "CLIPS %d  SAMPLES %d", mot.clips, mot.samples);
-    text_quads(v, ln, wr_mot[0] + 0.010f * W, ty, s2, W, H);
-    ty += lh;
-    snprintf(ln, sizeof ln, "MERKMAL 32D  N %.2f", mot.last_feat_norm);
-    text_quads(v, ln, wr_mot[0] + 0.010f * W, ty, s2, W, H);
-    ty += lh;
-    snprintf(ln, sizeof ln, "LORA-UPDATES %d", mot.updates);
-    text_quads(v, ln, wr_mot[0] + 0.010f * W, ty, s2, W, H);
-    ty += lh;
-    text_quads(v, "", wr_mot[0] + 0.010f * W, ty, s2, W, H);
-    ty += lh;
-    text_quads(v, "AUFZ: LETZTE 2.5 S AUFNEHMEN", wr_mot[0] + 0.010f * W, ty,
-               s2, W, H);
-    ty += lh;
-    text_quads(v, "UMW: IN 32D-DATENSATZ UMWANDELN", wr_mot[0] + 0.010f * W,
-               ty, s2, W, H);
-    ty += lh;
-    text_quads(v, "TRAIN: LORA-LYAPUNOV UPDATES", wr_mot[0] + 0.010f * W, ty,
-               s2, W, H);
-  }
-  glUniform4f(g_huColor, 1.f, 1.f, 1.f, 1.f);
-  stream_draw_2f(g_hud_vbo, g_huPos, v);
-
-  // ---- batch D: button labels ----
-  v.clear();
-  static const char* kNnBtn[2] = {"X", "KAM"};
-  static const char* kMotBtn[5] = {"X", "AUFZ", "UMW", "TRAIN", "LOESCH"};
-  for (int w = 0; w < WIN_COUNT; ++w) {
-    if (!(w == WIN_NN ? open_nn : open_mot)) continue;
-    const int n = (w == WIN_NN) ? 2 : 5;
-    for (int b = 0; b < n; ++b) {
-      float r[4];
-      if (!ui_window_button_rect(w, b, r)) continue;
-      const char* lbl = (w == WIN_NN) ? kNnBtn[b] : kMotBtn[b];
-      const float tw = text_width(lbl, s2);
-      text_quads(v, lbl, (r[0] + r[2]) * 0.5f - tw * 0.5f,
-                 (r[1] + r[3]) * 0.5f - 2.5f * s2, s2, W, H);
-    }
-  }
-  glUniform4f(g_huColor, 1.f, 1.f, 1.f, 1.f);
-  stream_draw_2f(g_hud_vbo, g_huPos, v);
-
-  glDisable(GL_BLEND);
-}
-
 // ---------------- picture-in-picture robot camera ----------------
 int gles_gl_errs() { return g_gl_errs.load(); }
 
@@ -1021,10 +1489,12 @@ static void gles_draw_pip() {
     frame = g_pip_buf;  // 20 KB copy, keeps the GL upload off the loop thread
   }
   const int W = g_win_w, H = g_win_h;
-  const float ph = 0.30f * H;
-  const float pw = ph * (float)g_pip_w / g_pip_h;  // keep source aspect
-  const float x1 = W - 0.015f * W, x0 = x1 - pw;
-  const float y0 = 0.06f * H, y1 = y0 + ph;
+  // v1.4.0: rect from the shared ui_pip_rect (draw + hit-test + label chip
+  // all agree; tapping toggles the large view)
+  float pr[4];
+  ui_pip_rect(pr);
+  const float x0 = pr[0], y0 = pr[1];
+  const float pw = pr[2] - pr[0], ph = pr[3] - pr[1];
   if (g_pip_tex == 0 || g_pip_w != kEvW || g_pip_h != kEvH) return;
 
   // v1.3.0 FLICKER FIX (field report: "Kamera-Bild wird kurz Vollbild").
@@ -1098,13 +1568,13 @@ static void gles_draw_pip() {
 // touch hit-test (v1.1.0 had two copies that could drift apart)
 void ui_button_rect(int i, float r[4]) {
   const int W = g_win_w, H = g_win_h;
-  const float m = 0.014f * W;
-  const float gap = 0.010f * W;
+  const float m = 0.012f * W;
+  const float gap = 0.009f * W;
   const float bw = (W - 2 * m - (BTN_COUNT - 1) * gap) / (float)BTN_COUNT;
-  const float bh = 0.105f * H;
+  const float bh = 0.115f * H;
   // pixel coords with TOP-left origin (matches Android touch coords)
   r[0] = m + i * (bw + gap);
-  r[1] = H - bh - 0.018f * H;
+  r[1] = H - bh - 0.020f * H;
   r[2] = r[0] + bw;
   r[3] = r[1] + bh;
 }
@@ -1284,6 +1754,10 @@ static const uint8_t* glyph_of(char c) {
     case '/': return kFont[38];
     case '.': return kFont[39];
     case ' ': return kFont[44];
+    case 0xE4: return kFont[40];  // ä
+    case 0xF6: return kFont[41];  // ö
+    case 0xFC: return kFont[42];  // ü
+    case 0xDF: return kFont[43];  // ß
   }
   return kFont[44];  // space for unknowns
 }

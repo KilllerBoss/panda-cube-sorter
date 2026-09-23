@@ -132,3 +132,30 @@ struct PcsMotState {
   char  msg[32] = {0};         // short status text for the MOT window
 };
 void gles_set_motion(const PcsMotState& s);
+
+// ---------------- v1.4.0 UI redesign (style, feedback, toasts) ----------------
+
+// toast accent colors (index into the renderer palette)
+enum PcsToastColor {
+  TOAST_GREEN = 0, TOAST_AMBER, TOAST_RED, TOAST_BLUE,
+  TOAST_VIOLET, TOAST_TEAL, TOAST_ORANGE, TOAST_GRAY
+};
+
+// show a toast notification (centered above the action bar, auto-fades).
+// Any thread; latest toast wins. msg: ASCII (A-Z 0-9 - : / . auml ouml uuml).
+void gles_toast(const char* msg, int color);
+
+// pressed-state feedback (input thread calls on ACTION_DOWN / MOVE / UP)
+void gles_set_pressed(int btn);       // -1 clears the bottom-bar press
+void gles_set_pressed_wb(int id);     // -1 clears the window-button press
+
+// tap-to-enlarge robot camera: hit test (window coords) + reset
+bool gles_hit_pip(float x, float y);
+void gles_pip_set_big(bool big);
+bool gles_pip_big();
+
+// two-step confirm for destructive MOT actions (LOESCH): arm -> press again
+// within 3 s -> action fires; auto-expires (checked by the draw loop)
+void gles_mot_arm_confirm();
+bool gles_mot_confirm_armed();  // auto-expires on read
+void gles_mot_disarm();
