@@ -58,8 +58,11 @@ class SimGlue {
   void resolve_ids();
   void refresh_eval();
   // warm-started damped-least-squares IK (approach axis down) for the real
-  // Menagerie Panda chain; runs on a private mjData, never on d_
-  void solve_ik_down(float tx, float ty, float tz, float* q_out);
+  // Menagerie Panda chain; runs on a private mjData, never on d_.
+  // v1.5.0: optional 7th task row — hand-Y yaw (face alignment for flank
+  // grips). yaw_valid=false leaves the wrist yaw free (nullspace).
+  void solve_ik_down(float tx, float ty, float tz, float yaw, bool yaw_valid,
+                     float* q_out);
 
   mjModel* m_ = nullptr;
   mjData*  d_ = nullptr;
@@ -73,6 +76,10 @@ class SimGlue {
   int act_grip_ = -1;
   int jnt_grip_[2] = {-1, -1};
   int n_cubes_ = 0;
+  int dbg_flight_ = 0;        // v1.5.0 debug: current flight/target slot
+  int dbg_phase_ = 0;         // v1.5.0 debug: previous cycle's phase
+  float dbg_s_ = 0.f;         // v1.5.0 debug: previous cycle's phase progress
+  float dbg_tgt_[3] = {0};    // v1.5.0 debug: previous cycle's tcp target
   int cube_jnt_[64], cube_body_[64], cube_geom_[64], cube_color_[64];
   int zone_body_[4] = {-1, -1, -1, -1};
   int cam_event_ = -1;
@@ -83,16 +90,27 @@ class SimGlue {
 
   // state
   float q_goal_[7] = {0}, q_des_prev_[7] = {0};
+  float q_goal_smooth_[7] = {0};   // v1.5.0: IIR-smoothed IK goal (nullspace)
   float last_tgt_[3] = {0};
   bool  have_tgt_ = false;
   float cube_pos_[64 * 3] = {0};
   float zone_pos_[4 * 2] = {0};
-  float kp_[7] = {70, 70, 60, 60, 30, 30, 22};
-  float kd_[7] = {9, 9, 8, 8, 5, 5, 4};
+  float kp_[7] = {120, 120, 100, 100, 60, 60, 40};
+  float kd_[7] = {20, 20, 17, 17, 11, 11, 9};
   bool  grasped_ = false, contact_l_ = false, contact_r_ = false;
   int   sorted_ = 0, stacked_ = 0;
   int   substeps_ = 5;
   bool  halted_ = false;
+  // v1.5.0 grasp assist (soft attachment): while a clamped cube is carried,
+  // a critically damped spring pulls it to its recorded hand-relative pose.
+  // The long Panda fingers + minjerk-free servoing leave a few mm of residual
+  // error; without the assist that error ejects the cube during the lift.
+  // The GRASP ITSELF (both pads in contact) stays a real, physics-detected
+  // event — only the carry is assisted.
+  bool  assist_ = false;
+  int   assist_cube_ = -1;
+  float assist_rel_[3] = {0};     // cube offset in hand frame at grasp time
+  float assist_q_[4] = {1, 0, 0, 0};  // hand quat at grasp time
 };
 
 }  // namespace pcs

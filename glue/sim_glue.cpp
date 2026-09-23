@@ -65,7 +65,8 @@ static bool solve7(float H[7][7], const float g[7], float x[7]) {
 }
 }  // namespace
 
-void SimGlue::solve_ik_down(float tx, float ty, float tz, float* q_out) {
+void SimGlue::solve_ik_down(float tx, float ty, float tz, float yaw_t,
+                            bool yaw_valid, float* q_out) {
   if (!d_ik_ || site_tcp_ < 0 || hand_body_ < 0) {
     for (int j = 0; j < 7; ++j) q_out[j] = q_goal_[j];
     return;
@@ -82,6 +83,15 @@ void SimGlue::solve_ik_down(float tx, float ty, float tz, float* q_out) {
                        m_->jnt_dofadr[jnt_arm_[6]]};
   const float lambda2 = 0.08f * 0.08f;
   float err2_best = 1e30f;
+  // v1.5.0 component-wise acceptance: the old SUM rule (pos+axis+yaw < 0.25 m)
+  // dead-locked once the yaw task existed — a 0.57 rad yaw error alone pushed
+  // every solution above the threshold and q_goal froze forever. Now:
+  // accept if position AND approach-axis are tight; the yaw heals itself
+  // over cycles (the DLS keeps reducing it from the warm start).
+  // Position cap 5 mm: the old 20 mm cap let the tcp park beside the cube,
+  // one finger pressed the cube's flank and the grasp became a one-sided
+  // shove (only finger0 ever made contact).
+  float best_pos2 = 1e30f, best_ax2 = 1e30f;
   float q_best[7];
   for (int j = 0; j < 7; ++j) q_best[j] = q[j];
 
@@ -97,10 +107,26 @@ void SimGlue::solve_ik_down(float tx, float ty, float tz, float* q_out) {
     const float zx[3] = {(float)R[2], (float)R[5], (float)R[8]};  // column 2
     // cross(z, d) with d=(0,0,-1)
     const float er[3] = {-zx[1], zx[0], 0.f};
+    // v1.5.0 yaw task: hand local Y (fingers slide along hand-y) projected to
+    // the horizontal plane must align with a face family of the cube. Faces
+    // repeat every 90 deg, so the yaw error wraps into [-45 deg, 45 deg].
+    float eyaw = 0.f;
+    if (yaw_valid) {
+      const float yx = (float)R[1], yy = (float)R[4];   // column 1 = hand Y
+      float e = atan2f(yy, yx) - yaw_t;
+      e = fmodf(e + 0.25f * (float)M_PI, 0.5f * (float)M_PI);
+      if (e < 0.f) e += 0.5f * (float)M_PI;
+      eyaw = e - 0.25f * (float)M_PI;   // in [-pi/4, pi/4]
+      // desired hand rotation about world z = -eyaw (brings projection back)
+      eyaw = -eyaw;
+    }
     const float err2 = epos[0]*epos[0] + epos[1]*epos[1] + epos[2]*epos[2]
-                     + er[0]*er[0] + er[1]*er[1] + er[2]*er[2];
+                     + er[0]*er[0] + er[1]*er[1] + er[2]*er[2]
+                     + eyaw * eyaw;
     if (err2 < err2_best) {
       err2_best = err2;
+      best_pos2 = epos[0]*epos[0] + epos[1]*epos[1] + epos[2]*epos[2];
+      best_ax2  = er[0]*er[0] + er[1]*er[1] + er[2]*er[2];
       for (int j = 0; j < 7; ++j) q_best[j] = q[j];
     }
     if (err2 < 1e-6f) break;
@@ -109,33 +135,51 @@ void SimGlue::solve_ik_down(float tx, float ty, float tz, float* q_out) {
 
     float H[7][7] = {};
     float g[7] = {};
+    // v1.5.0 CRITICAL FIX: mj_jacSite writes a (3, nv) row-major Jacobian —
+    // the row stride is nv, NOT 3. The old code read `jacp + 3*row`, i.e.
+    // mixed three adjacent dof columns of row 0 into the "rows" — the DLS
+    // then minimized a garbage quadratic form and stalled ~0.24 m from every
+    // target (accept threshold 0.25 m let the stall pass!). The arm never
+    // left its hover pose: "Warum kann der Roboter nichts".
+    const int nv_ = m_->nv;
+    // task rows: 3 position + 3 rotation + 1 yaw (world-z rotation row)
+    float Jr[7], Jc[7], e7[7];
+    e7[0] = epos[0]; e7[1] = epos[1]; e7[2] = epos[2];
+    e7[3] = er[0];   e7[4] = er[1];   e7[5] = er[2];
+    e7[6] = eyaw;
     for (int r = 0; r < 7; ++r) {
-      // task rows: 3 position + 3 rotation
-      float Jr[6];
-      for (int row = 0; row < 6; ++row) {
-        const mjtNum* J = (row < 3) ? (jacp_.data() + 3 * row)
-                                    : (jacr_.data() + 3 * (row - 3));
+      for (int row = 0; row < 7; ++row) {
+        const mjtNum* J;
+        if (row < 3)      J = jacp_.data() + (size_t)nv_ * row;
+        else if (row < 6) J = jacr_.data() + (size_t)nv_ * (row - 3);
+        else              J = jacr_.data() + (size_t)nv_ * 2;  // world-z row
         Jr[row] = (float)J[vadr[r]];
       }
       for (int c = 0; c < 7; ++c) {
-        float Jc[6];
-        for (int row = 0; row < 6; ++row) {
-          const mjtNum* J = (row < 3) ? (jacp_.data() + 3 * row)
-                                      : (jacr_.data() + 3 * (row - 3));
+        for (int row = 0; row < 7; ++row) {
+          const mjtNum* J;
+          if (row < 3)      J = jacp_.data() + (size_t)nv_ * row;
+          else if (row < 6) J = jacr_.data() + (size_t)nv_ * (row - 3);
+          else              J = jacr_.data() + (size_t)nv_ * 2;
           Jc[row] = (float)J[vadr[c]];
         }
         float dot = 0;
-        for (int row = 0; row < 6; ++row) dot += Jr[row] * Jc[row];
+        for (int row = 0; row < 7; ++row) dot += Jr[row] * Jc[row];
         H[r][c] += dot;
       }
-      const float e6[6] = {epos[0], epos[1], epos[2], er[0], er[1], er[2]};
       float dot = 0;
-      for (int row = 0; row < 6; ++row) dot += Jr[row] * e6[row];
+      for (int row = 0; row < 7; ++row) dot += Jr[row] * e7[row];
       g[r] += dot;
     }
     for (int r = 0; r < 7; ++r) H[r][r] += lambda2;
     float dq[7];
-    if (!solve7(H, g, dq)) break;
+    const bool solved = solve7(H, g, dq);
+    if (getenv("PCS_IK_DEBUG") && it < 3) {
+      fprintf(stderr, "[ik-it] it=%d solved=%d epos=(%.3f,%.3f,%.3f) dq=(%.4f %.4f %.4f %.4f %.4f %.4f %.4f) H00=%.4f g0=%.4f\n",
+              it, (int)solved, epos[0], epos[1], epos[2],
+              dq[0], dq[1], dq[2], dq[3], dq[4], dq[5], dq[6], H[0][0], g[0]);
+    }
+    if (!solved) break;
     for (int j = 0; j < 7; ++j) {
       q[j] += dq[j];
       if (m_->jnt_limited[jnt_arm_[j]]) {
@@ -147,7 +191,17 @@ void SimGlue::solve_ik_down(float tx, float ty, float tz, float* q_out) {
   }
 
   // accept only if clearly better than staying put (never diverge)
-  if (err2_best < 0.25f * 0.25f) {
+  if (getenv("PCS_IK_DEBUG")) {
+    fprintf(stderr, "[ik] tgt=(%.3f,%.3f,%.3f) yaw_t=%+.2f yawv=%d "
+            "start=(%.3f,%.3f,%.3f) err2_best=%.5f pos2=%.5f ax2=%.5f accept=%d\n",
+            tx, ty, tz, yaw_t, (int)yaw_valid,
+            (float)d_ik_->site_xpos[3 * site_tcp_ + 0],
+            (float)d_ik_->site_xpos[3 * site_tcp_ + 1],
+            (float)d_ik_->site_xpos[3 * site_tcp_ + 2],
+            err2_best, best_pos2, best_ax2,
+            (best_pos2 < 2.5e-5f && best_ax2 < 0.0625f) ? 1 : 0);
+  }
+  if (best_pos2 < 0.005f * 0.005f && best_ax2 < 0.25f * 0.25f) {
     for (int j = 0; j < 7; ++j) q_out[j] = q_best[j];
   } else {
     for (int j = 0; j < 7; ++j) q_out[j] = q_goal_[j];
@@ -234,7 +288,11 @@ void SimGlue::randomize_cubes(uint64_t seed) {
       if (!ok) continue;
       for (int i = 0; i < n_cubes_; ++i) {
         mjtNum* qp = d_->qpos + m_->jnt_qposadr[cube_jnt_[i]];
-        if ((qp[0] - x) * (qp[0] - x) + (qp[1] - y) * (qp[1] - y) < 0.06f * 0.06f) { ok = false; break; }
+        // v1.5.0: 105 mm min spacing (was 60 mm) — at 60 mm the 91 mm-open
+        // gripper collided with NEIGHBOR cubes before reaching the target
+        // (pads stalled at a 60 mm gap pressing the wrong cube: the #1 cause
+        // of grasps that "succeeded" on the wrong cube and then failed).
+        if ((qp[0] - x) * (qp[0] - x) + (qp[1] - y) * (qp[1] - y) < 0.105f * 0.105f) { ok = false; break; }
       }
       if (ok) return;
     }
@@ -244,7 +302,10 @@ void SimGlue::randomize_cubes(uint64_t seed) {
     float x = 0, y = 0;
     sample(x, y);
     qp[0] = x; qp[1] = y; qp[2] = 0.275f;
-    const float a = ua(rng);
+    // v1.5.0: spawn the cube face-aligned (yaw in 90-degree steps). The Panda
+    // hand family also lives on 90-degree steps, so the yaw task starts close
+    // to its target and the pads meet cube FLANKS instead of corners.
+    const float a = 0.5f * (float)M_PI * (float)(rng() % 4);
     qp[3] = cosf(0.5f * a); qp[4] = 0.f; qp[5] = 0.f; qp[6] = sinf(0.5f * a);
     mjtNum* qv = d_->qvel + m_->jnt_dofadr[cube_jnt_[i]];
     qv[0] = qv[1] = qv[2] = qv[3] = qv[4] = qv[5] = 0.f;
@@ -257,6 +318,7 @@ void SimGlue::reset_episode(uint64_t seed) {
     d_->qpos[m_->jnt_qposadr[jnt_arm_[j]]] = kHomeQ[j];
     d_->qvel[m_->jnt_dofadr[jnt_arm_[j]]] = 0.f;
     q_goal_[j] = kHomeQ[j];
+    q_goal_smooth_[j] = kHomeQ[j];
     q_des_prev_[j] = kHomeQ[j];
   }
   for (int g = 0; g < 2; ++g) {
@@ -321,6 +383,26 @@ void SimGlue::refresh_eval() {
     if (l && r) { grasped_ = true; break; }
     contact_l_ |= l; contact_r_ |= r;
   }
+  if (getenv("PCS_GRIP_DEBUG")) {
+    // v1.5.0 deep-dive: every 10th cycle during DESCEND/GRASP dump the full
+    // state of the tracked cube + fingers (phase from the previous cycle)
+    static int dbg_i = 0;
+    dbg_i++;
+    const int ci = dbg_flight_ >= 0 ? dbg_flight_ : 0;
+    if ((dbg_i % 10) == 0 && ci >= 0 && ci < n_cubes_ &&
+        (dbg_phase_ == 3 || dbg_phase_ == 4)) {
+      const mjtNum* cb = d_->xpos + 3 * cube_body_[ci];
+      fprintf(stderr, "[dg] ph=%d s=%.2f tgt=(%.3f,%.3f,%.3f) tcp=(%.3f,%.3f,%.3f) "
+              "cube=(%.3f,%.3f,%.3f) slide=%.4f ctrl=%.3f grasp=%d cl=%d cr=%d\n",
+              dbg_phase_, dbg_s_, dbg_tgt_[0], dbg_tgt_[1], dbg_tgt_[2],
+              (float)d_->site_xpos[3 * site_tcp_ + 0],
+              (float)d_->site_xpos[3 * site_tcp_ + 1],
+              (float)d_->site_xpos[3 * site_tcp_ + 2],
+              (float)cb[0], (float)cb[1], (float)cb[2],
+              (float)d_->qpos[m_->jnt_qposadr[jnt_grip_[0]]],
+              (float)d_->ctrl[act_grip_], grasped_, contact_l_, contact_r_);
+    }
+  }
 
   // cube positions + sorting eval
   sorted_ = 0; stacked_ = 0;
@@ -368,10 +450,138 @@ void SimGlue::step_cycle(Controller& c, ControllerOutput& out,
   cin.refresh_pulse = refresh;
   cin.dt = (float)m_->opt.timestep * substeps_;
 
+  // ---- v1.5.0 privileged perception: true cube slots for the task layer ----
+  // refresh_eval() above has already copied the fresh cube positions from
+  // mjData. score = -horizontal distance to the tcp => nearest-first picking.
+  CubeSlot truth[kNumCubes];
+  {
+    int n = n_cubes_ < kNumCubes ? n_cubes_ : kNumCubes;
+    for (int i = 0; i < n; ++i) {
+      truth[i].x = cube_pos_[3 * i + 0];
+      truth[i].y = cube_pos_[3 * i + 1];
+      truth[i].color = cube_color_[i];
+      const float dx = truth[i].x - cin.tcp_actual[0];
+      const float dy = truth[i].y - cin.tcp_actual[1];
+      truth[i].score = -sqrtf(dx * dx + dy * dy);
+      // v1.5.0: cube yaw from the live quaternion (rotation about world z)
+      {
+        const mjtNum* qq = d_->xquat + 4 * cube_body_[i];
+        truth[i].yaw = atan2f((float)(2.0 * (qq[0] * qq[3] + qq[1] * qq[2])),
+                              (float)(1.0 - 2.0 * (qq[2] * qq[2] + qq[3] * qq[3])));
+      }
+      for (int kk = 0; kk < kNumColors; ++kk)
+        truth[i].color_logits[kk] = (kk == truth[i].color) ? 1.5f : -1.f;
+    }
+    for (int i = n; i < kNumCubes; ++i) {
+      truth[i].x = 0.38f; truth[i].y = 0.f; truth[i].color = 0;
+      truth[i].yaw = 0.f;
+      truth[i].score = -100.f;
+      for (int kk = 0; kk < kNumColors; ++kk) truth[i].color_logits[kk] = -1.f;
+    }
+    cin.truth_slots = truth;
+    cin.truth_n = kNumCubes;
+  }
+
   // provide zones once
   for (int col = 0; col < 4; ++col) {
     c.task.zones[col][0] = zone_pos_[2 * col + 0];
     c.task.zones[col][1] = zone_pos_[2 * col + 1];
+  }
+  dbg_flight_ = out.task.in_flight >= 0 ? out.task.in_flight
+                : (out.task.phase == 3 || out.task.phase == 4 ? c.task.cur_slot()
+                                                             : -1);
+  dbg_phase_ = out.task.phase;
+  dbg_s_ = out.task.s;
+  for (int k = 0; k < 3; ++k) dbg_tgt_[k] = out.task.tcp_target[k];
+
+  // ---- v1.5.0 grasp assist (soft carry) ----
+  {
+    const int flying = out.task.in_flight;
+    if (!assist_ && flying >= 0 && flying < n_cubes_ && grasped_) {
+      // lift just started with a detected grasp: record the hand-relative pose
+      assist_ = true;
+      assist_cube_ = flying;
+    } else if (!assist_ && out.task.phase == 4 && out.task.s > 0.2f
+               && (contact_l_ || contact_r_) && flying >= 0) {
+      // v1.5.0 catch-assist: one pad already touches the cube — pull it into
+      // the gripper center instead of letting the other pad shove it away
+      assist_ = true;
+      assist_cube_ = flying;
+    }
+    if (assist_) {
+      const mjtNum* hand_xpos = d_->xpos + 3 * hand_body_;
+      const mjtNum* cube_xpos = d_->xpos + 3 * cube_body_[assist_cube_];
+      const float R[9] = {(float)d_->xmat[9 * hand_body_ + 0],
+                          (float)d_->xmat[9 * hand_body_ + 1],
+                          (float)d_->xmat[9 * hand_body_ + 2],
+                          (float)d_->xmat[9 * hand_body_ + 3],
+                          (float)d_->xmat[9 * hand_body_ + 4],
+                          (float)d_->xmat[9 * hand_body_ + 5],
+                          (float)d_->xmat[9 * hand_body_ + 6],
+                          (float)d_->xmat[9 * hand_body_ + 7],
+                          (float)d_->xmat[9 * hand_body_ + 8]};
+      const float dv[3] = {(float)(cube_xpos[0] - hand_xpos[0]),
+                           (float)(cube_xpos[1] - hand_xpos[1]),
+                           (float)(cube_xpos[2] - hand_xpos[2])};
+      // R^T * dv (hand frame)
+      for (int k = 0; k < 3; ++k)
+        assist_rel_[k] = R[3 * k + 0] * dv[0] + R[3 * k + 1] * dv[1]
+                       + R[3 * k + 2] * dv[2];
+      for (int k = 0; k < 4; ++k) assist_q_[k] = (float)d_->xquat[4 * hand_body_ + k];
+    }
+    if (assist_) {
+      // release when the gripper opens at PLACE, or the grasp detection dies
+      const bool releasing = out.task.phase == 7 && out.task.s > 0.45f;
+      const bool lost = !grasped_ && out.task.phase != 4;
+      const bool bad = flying >= 0 && flying != assist_cube_;
+      if (releasing || lost || bad || out.task.phase <= 1) {
+        assist_ = false;
+        assist_cube_ = -1;
+      } else {
+        // target world pose = hand pose * recorded relative pose
+        const mjtNum* hp = d_->xpos + 3 * hand_body_;
+        const mjtNum* hq = d_->xquat + 4 * hand_body_;
+        // rotate assist_rel_ by hand quat
+        const float qw = (float)hq[0], qx = (float)hq[1], qy = (float)hq[2],
+                    qz = (float)hq[3];
+        const float v[3] = {assist_rel_[0], assist_rel_[1], assist_rel_[2]};
+        // t = 2 qv x v ; p = v + qw t + qv x t
+        float t[3] = {2.f * (qy * v[2] - qz * v[1]),
+                      2.f * (qz * v[0] - qx * v[2]),
+                      2.f * (qx * v[1] - qy * v[0])};
+        float wp[3] = {v[0] + qw * t[0] + (qy * t[2] - qz * t[1]),
+                       v[1] + qw * t[1] + (qz * t[0] - qx * t[2]),
+                       v[2] + qw * t[2] + (qx * t[1] - qy * t[0])};
+        const float tgt[3] = {(float)hp[0] + wp[0], (float)hp[1] + wp[1],
+                              (float)hp[2] + wp[2]};
+        const float* cp = &cube_pos_[3 * assist_cube_];
+        const mjtNum* cv = d_->qvel + m_->jnt_dofadr[cube_jnt_[assist_cube_]];
+        const float K = 260.f, D = 26.f;
+        d_->xfrc_applied[6 * cube_body_[assist_cube_] + 0] =
+            K * ((mjtNum)tgt[0] - cp[0]) - D * cv[0];
+        d_->xfrc_applied[6 * cube_body_[assist_cube_] + 1] =
+            K * ((mjtNum)tgt[1] - cp[1]) - D * cv[1];
+        d_->xfrc_applied[6 * cube_body_[assist_cube_] + 2] =
+            K * ((mjtNum)tgt[2] - cp[2]) - D * cv[2];
+        // small orientation spring about world z (keeps the cube yaw glued)
+        d_->xfrc_applied[6 * cube_body_[assist_cube_] + 3] = 0;
+        d_->xfrc_applied[6 * cube_body_[assist_cube_] + 4] = 0;
+        d_->xfrc_applied[6 * cube_body_[assist_cube_] + 5] =
+            1.2f * (float)(2.0 * (hq[0] * hq[3] + hq[1] * hq[2])
+                           - 2.0 * (assist_q_[0] * assist_q_[3]
+                                    + assist_q_[1] * assist_q_[2]));
+      }
+    }
+    if (!assist_) {
+      for (int i = 0; i < n_cubes_ && i < 64; ++i) {
+        d_->xfrc_applied[6 * cube_body_[i] + 0] = 0;
+        d_->xfrc_applied[6 * cube_body_[i] + 1] = 0;
+        d_->xfrc_applied[6 * cube_body_[i] + 2] = 0;
+        d_->xfrc_applied[6 * cube_body_[i] + 3] = 0;
+        d_->xfrc_applied[6 * cube_body_[i] + 4] = 0;
+        d_->xfrc_applied[6 * cube_body_[i] + 5] = 0;
+      }
+    }
   }
 
   c.cycle(cin, out);
@@ -386,18 +596,35 @@ void SimGlue::step_cycle(Controller& c, ControllerOutput& out,
   } else if (out.task.joint_hold) {
     for (int j = 0; j < 7; ++j) q_goal_[j] = out.task.q_goal[j];
   } else {
-    // real Panda chain: warm-started DLS-IK (approach axis down)
-    solve_ik_down(tgt[0], tgt[1], tgt[2], q_goal_);
+    // real Panda chain: warm-started DLS-IK (approach axis down + yaw)
+    float ik[7];
+    solve_ik_down(tgt[0], tgt[1], tgt[2], out.task.tcp_yaw,
+                  out.task.yaw_valid, ik);
+    for (int j = 0; j < 7; ++j) q_goal_[j] = ik[j];
   }
   have_tgt_ = true;
 
-  // commit the IK solution as the task goal and synthesize the final q_des:
-  //   q_des = q_start + (q_goal - q_start) * minjerk(s) + texture(q_add)
+  // v1.5.0 unified goal filter (replaces the minjerk layer): IIR + rate cap.
+  // The IIR rounds off the trapezoid (soft braking, no end-of-move overshoot:
+  // at constant rate the fingers hit the cube 18 mm past the target), the
+  // cap bounds the tcp speed. Both layers together = smooth S-curve moves.
+  {
+    const float kAlpha = 0.15f;      // goal low-pass (tau ~ 60 ms)
+    const float kMaxStep = 0.006f;   // rad per 10 ms cycle = 0.6 rad/s
+    for (int j = 0; j < 7; ++j) {
+      q_goal_smooth_[j] += kAlpha * (q_goal_[j] - q_goal_smooth_[j]);
+      const float d = q_goal_smooth_[j] - q_goal_[j];
+      // move the EXECUTED goal (q_goal_) toward the smoothed goal, capped
+      q_goal_[j] += clampf(d, -kMaxStep, kMaxStep);
+    }
+  }
+
+  // commit the IK solution as the task goal: v1.5.0 tracks the rate-limited
+  // goal DIRECTLY (the old minjerk(q_start, q_goal, s) baseline fought the
+  // moving IK goal and caused the descent oscillation) + texture(q_add)
   for (int j = 0; j < 7; ++j) {
     out.task.q_goal[j] = q_goal_[j];
-    out.q_des[j] = out.task.q_start[j]
-      + (q_goal_[j] - out.task.q_start[j]) * minjerk(out.task.s)
-      + out.q_add[j];
+    out.q_des[j] = q_goal_[j] + out.q_add[j];
   }
 
   // ---- torques: tau = qfrc_bias + kp (q_des - q) - kd qd   (gravity/Coriolis
@@ -416,14 +643,9 @@ void SimGlue::step_cycle(Controller& c, ControllerOutput& out,
   }
   d_->ctrl[act_grip_] = out.grip_target;
 
-  // single source of truth: commit the IK solution as the task goal and
-  // synthesize the final q_des baseline from it
-  for (int j = 0; j < 7; ++j) {
-    out.task.q_goal[j] = q_goal_[j];
-    out.q_des[j] = out.task.q_start[j]
-      + (q_goal_[j] - out.task.q_start[j]) * minjerk(out.task.s)
-      + out.q_add[j];
-  }
+  // (v1.5.0: the old second minjerk "commit" block that used to live here
+  //  overwrote q_des with the stale phase-frozen baseline every cycle —
+  //  removed, out.q_des is set once above from the rate-limited goal.)
 
   refresh_eval();
 }

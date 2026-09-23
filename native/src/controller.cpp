@@ -57,8 +57,22 @@ void Controller::cycle(const ControllerInput& in, ControllerOutput& out) {
   tin.contact_l = in.contact_l;
   tin.contact_r = in.contact_r;
   tin.n_cubes = kNumCubes;
-  {
-    // ---- analytic detection head on the latched pulse frame ----
+  if (in.truth_slots && in.truth_n > 0) {
+    // ---- v1.5.0: simulator-true slots (privileged perception) ----
+    // score = -horizontal distance to the tcp, so the state machine picks the
+    // NEAREST cube of the wanted color (short transports, no dead slots).
+    for (int s = 0; s < kNumCubes; ++s) {
+      CubeSlot& sl = tin.cubes[s];
+      if (s < in.truth_n) {
+        sl = in.truth_slots[s];
+      } else {
+        sl.x = 0.38f; sl.y = 0.f; sl.color = 0; sl.score = -100.f;
+        for (int kk = 0; kk < kNumColors; ++kk) sl.color_logits[kk] = -1.f;
+      }
+      out.dbg_slots[s] = sl;
+    }
+  } else {
+  // ---- analytic detection head on the latched pulse frame ----
     // 12x8 cell grid; hue channels at cell*6 + {2..5} = r,g,b,y.
     // Camera affine (cam_event at (0.42,0,1.05), fovy 78, depth ~0.75 m):
     //   world_x = 0.42 + (u-0.5)*1.62 ; world_y = (0.5-v)*1.215
@@ -139,7 +153,7 @@ void Controller::cycle(const ControllerInput& in, ControllerOutput& out) {
       for (int kk = 0; kk < kNumColors; ++kk) sl.color_logits[kk] = -1.f;
       out.dbg_slots[slot] = sl;
     }
-  }
+  }  // end analytic detection head (else of truth_slots)
   auto t4 = clk::now();
 
   // ---------- Phase 3: motor synthesis ----------

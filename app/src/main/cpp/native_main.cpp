@@ -154,7 +154,7 @@ static void ui_fire_wb(int wb) {
   switch (wb) {
     case 1: gles_toggle_window(WIN_NN); break;      // NN window close
     case 2: gles_cam_reset();                       // NN window: KAM
-      gles_toast("KAMERA ZURUECKGESETZT", TOAST_BLUE);
+      gles_toast("KAMERA ZURÜCKGESETZT", TOAST_BLUE);
       break;
     case 3: gles_toggle_window(WIN_MOT); break;     // MOT window close
     case 4: s.mot_record = true; break;             // AUFZ
@@ -163,7 +163,7 @@ static void ui_fire_wb(int wb) {
     case 7:                                          // LOESCH (2-step)
       if (!gles_mot_confirm_armed()) {
         gles_mot_arm_confirm();
-        gles_toast("LOESCH: ERNEUT DRUECKEN", TOAST_RED);
+        gles_toast("LÖSCHEN: ERNEUT DRÜCKEN", TOAST_RED);
         return;
       }
       gles_mot_disarm();
@@ -796,7 +796,7 @@ static void execution_loop() {
       std::lock_guard<std::mutex> lk(g_window_mutex);
       if (g_window) {
         gles_init(g_glue, ANativeWindow_getWidth(g_window),
-                  ANativeWindow_getHeight(g_window));
+                  ANativeWindow_getHeight(g_window), g_activity->assetManager);
         g_gl_ready = true;
         LOGI("gles_init done (loop context, fallback)");
       }
@@ -832,7 +832,7 @@ static void execution_loop() {
     if (ui.stop) {
       g_glue.set_halt(!g_glue.halted());  // STOP toggles freeze
       LOGI("button: STOP -> %s", g_glue.halted() ? "halt" : "run");
-      gles_toast(g_glue.halted() ? "ROBOTER GESTOPPT" : "LAEUFT WIEDER",
+      gles_toast(g_glue.halted() ? "ROBOTER GESTOPPT" : "L\u00c4UFT WIEDER",
                  g_glue.halted() ? TOAST_RED : TOAST_GREEN);
     }
     if (ui.fine) {
@@ -868,7 +868,7 @@ static void execution_loop() {
     }
     if (ui.mot_clear) {
       mot_clear_all();
-      gles_toast("MOTION DATEN GELOESCHT", TOAST_RED);
+      gles_toast("MOTION-DATEN GEL\u00d6SCHT", TOAST_RED);
     }
 
     if (g_new_episode.exchange(false)) {
@@ -1113,7 +1113,7 @@ static void app_worker(ANativeActivity* activity) {
       // the loop ends up without any EGL binding (LB_NONE).
       if (!g_gl_ready.load()) {
         gles_init(g_glue, ANativeWindow_getWidth(win),
-                  ANativeWindow_getHeight(win));
+                  ANativeWindow_getHeight(win), g_activity->assetManager);
         g_gl_ready = true;
         LOGI("gles_init done (view context)");
       }

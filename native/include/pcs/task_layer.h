@@ -11,6 +11,7 @@ namespace pcs {
 
 struct CubeSlot {          // decoded perception output per slot
   float x, y;              // table-plane position estimate (m)
+  float yaw;               // v1.5.0: cube yaw about world z (rad)
   float color_logits[kNumColors];
   int   color;             // argmax
   float score;             // slot activity (confidence)
@@ -36,6 +37,8 @@ struct TaskOutput {
   float q_goal[kDof];      // joint goal for this phase (IK from cartesian)
   float grip_target;       // 0..0.025 slide target
   float tcp_target[3];     // cartesian target (for glue IK)
+  float tcp_yaw;           // v1.5.0: desired hand-Y yaw (face alignment)
+  bool  yaw_valid;         // v1.5.0: control hand yaw (false = free)
   bool  ik_needed;         // phase transition: glue reseeds the IK here
   bool  joint_hold;        // task provides q_goal directly (carry/home hold)
   bool  episode_done;
@@ -49,6 +52,7 @@ class TaskLayer {
  public:
   void reset();
   void update(const TaskInput& in, TaskOutput& out);
+  int  cur_slot() const { return cur_slot_; }   // v1.5.0 debug/eval helper
 
   float zones[4][2];               // zone centers xy (world), set by glue
   int   zone_stack[4] = {0,0,0,0}; // cubes placed per color
@@ -66,6 +70,7 @@ class TaskLayer {
   int   cur_slot_ = -1;
   float q_start_[kDof] = {0};
   float grab_xy_[2] = {0};              // cube xy frozen at descent start
+  float grab_yaw_ = 0.f;                // v1.5.0: cube yaw frozen with it
   int   prev_phase_ = PH_RESET;
   bool  have_grab_ = false;
 

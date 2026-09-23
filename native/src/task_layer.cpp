@@ -10,6 +10,8 @@ namespace pcs {
 // hand origin; pads at 0.103): grasp = pads beside cube mid-height =>
 // tcp = 0.275 - 0.023 = 0.252; carried cubes ride ~0.023 above tcp.
 static constexpr float kGraspZ   = 0.252f;   // pads beside cube mid-height
+static constexpr float kAlignZ   = 0.282f;   // v1.5.0 stage-1 stop: pads 28 mm
+                                             // above cube mid-height (funnel)
 static constexpr float kPlaceZ0  = 0.252f;   // cube bottom touches table/stack
 static constexpr float kTransZ   = 0.42f;
 static constexpr float kStackDz  = 0.052f;   // cube height + clearance
@@ -28,11 +30,11 @@ static float phase_duration(int p) {
     case PH_RESET: return 0.3f;
     case PH_HOME: return 1.1f;
     case PH_HOVER: return 0.7f;
-    case PH_DESCEND: return 1.0f;
-    case PH_GRASP: return 0.55f;
-    case PH_LIFT: return 0.9f;
-    case PH_TRANSPORT: return 1.1f;
-    case PH_PLACE: return 1.0f;
+    case PH_DESCEND: return 2.4f;   // v1.5.0: langsam + kritisch gedaempft
+    case PH_GRASP: return 0.9f;     // v1.5.0: Zeit fuer den Kraftaufbau
+    case PH_LIFT: return 1.3f;      // v1.5.0: langsamer = rueckelt nicht raus
+    case PH_TRANSPORT: return 1.3f;
+    case PH_PLACE: return 1.2f;
   }
   return 1.f;
 }
@@ -70,6 +72,10 @@ inline float dist3(const float* a, const float* b) {
   const float dx = a[0]-b[0], dy = a[1]-b[1], dz = a[2]-b[2];
   return sqrtf(dx*dx + dy*dy + dz*dz);
 }
+inline float dist2xy(const float* a, const float* b) {
+  const float dx = a[0]-b[0], dy = a[1]-b[1];
+  return sqrtf(dx*dx + dy*dy);
+}
 }  // namespace
 
 void TaskLayer::update(const TaskInput& in, TaskOutput& out) {
@@ -79,6 +85,8 @@ void TaskLayer::update(const TaskInput& in, TaskOutput& out) {
   out.in_flight = in_flight_ ? flight_slot_ : -1;
   out.active_color = next_color_;
   out.grip_target = kGripOpen;
+  out.yaw_valid = false;
+  out.tcp_yaw = 0.f;
   for (int j = 0; j < kDof; ++j) out.q_start[j] = q_start_[j];
   out.tcp_target[0] = 0.42f; out.tcp_target[1] = 0.f; out.tcp_target[2] = 0.43f;
   out.joint_hold = false;
@@ -134,57 +142,102 @@ void TaskLayer::update(const TaskInput& in, TaskOutput& out) {
         const CubeSlot& c = in.cubes[cur_slot_];
         out.tcp_target[0] = c.x;
         out.tcp_target[1] = c.y;
+        // v1.5.0: rotate the hand to the cube's face family WHILE hovering —
+        // flank grips (50 mm) are stable; corner grips slip during LIFT
+        out.tcp_yaw = c.yaw;
+        out.yaw_valid = true;
       }
       out.tcp_target[2] = kTransZ;
       out.grip_target = kGripOpen;
-      if (out.s >= 1.f) start_phase(PH_DESCEND, in, out);
+      if (out.s >= 1.f) {
+        // v1.5.0: FREEZE the grasp point NOW. Tracking the live cube position
+        // during DESCEND/GRASP made the gripper chase (and push) the sliding
+        // cube across the table — the classic "schieben statt greifen".
+        if (cur_slot_ >= 0 && cur_slot_ < in.n_cubes) {
+          grab_xy_[0] = in.cubes[cur_slot_].x;
+          grab_xy_[1] = in.cubes[cur_slot_].y;
+          grab_yaw_ = in.cubes[cur_slot_].yaw;
+          have_grab_ = true;
+        }
+        start_phase(PH_DESCEND, in, out);
+      }
       break;
     }
 
     case PH_DESCEND: {
-      // live tracking of the decoded cube + capture-gap funnel: the pads
-      // squeeze rotated corners into alignment (~1.5 N < table friction*mu)
+      // v1.5.0 two-stage approach: stage 1 stops ABOVE the cube (pads ~28 mm
+      // over cube mid-height) while the pads pre-close to just over both the
+      // flank (50 mm) and diagonal (71 mm) envelopes — the funnel aligns a
+      // rotated cube without pushing it.
       out.s = phase_t_ / phase_dur_;
-      if (cur_slot_ >= 0 && cur_slot_ < in.n_cubes) {
-        const CubeSlot& c = in.cubes[cur_slot_];
-        out.tcp_target[0] = c.x + wiggle_dx_;
-        out.tcp_target[1] = c.y + wiggle_dy_;
-      }
-      out.tcp_target[2] = kGraspZ;
-      // funnel: fully open (91 mm, over-diagonal) all the way down; the
-      // pre-close to diagonal-contact (stationary) happens at the bottom and
-      // the final close to kGripClosed in PH_GRASP
+      out.tcp_target[0] = grab_xy_[0] + wiggle_dx_;
+      out.tcp_target[1] = grab_xy_[1] + wiggle_dy_;
+      out.tcp_target[2] = kAlignZ;
+      out.tcp_yaw = grab_yaw_;
+      out.yaw_valid = true;
       float g;
-      if (out.s < 0.5f) g = kGripOpen;
-      else g = kGripOpen + (kGripPre - kGripOpen) * std::min(1.f, (out.s - 0.5f) / 0.2f);
+      if (out.s < 0.30f) g = kGripOpen;
+      else g = kGripOpen + (kGripPre - kGripOpen)
+                        * std::min(1.f, (out.s - 0.30f) / 0.45f);
       out.grip_target = g;
-      if ((out.s >= 1.f && dist3(in.tcp_actual, out.tcp_target) < 0.02f) || phase_t_ >= 4.f)
+      // v1.5.0: stage-1 exit requires the XY error to be TIGHT (8 mm) — the
+      // old combined 3D 25 mm gate let the gripper descend with a lateral
+      // offset that pressed one finger into the cube's flank and shoved it.
+      const float pxy[3] = {out.tcp_target[0], out.tcp_target[1],
+                            in.tcp_actual[2]};
+      const float txy[3] = {out.tcp_target[0], out.tcp_target[1],
+                            out.tcp_target[2]};
+      const bool xy_ok = dist2xy(in.tcp_actual, pxy) < 0.008f;
+      const bool z_ok = dist3(in.tcp_actual, txy) < 0.012f;
+      // one-sided touch while descending: klemme sofort, statt zu schieben
+      if (in.contact_l != in.contact_r && out.s > 0.3f) {
+        start_phase(PH_GRASP, in, out);
+        break;
+      }
+      if ((out.s >= 1.f && xy_ok && z_ok) || phase_t_ >= 8.f)
         start_phase(PH_GRASP, in, out);
       break;
     }
 
     case PH_GRASP: {
+      // stage 2: descend the last 23 mm WHILE closing pre -> closed; the
+      // cube is gripped around its flanks instead of pushed sideways
       out.s = phase_t_ / phase_dur_;
+      out.tcp_target[0] = grab_xy_[0] + wiggle_dx_;
+      out.tcp_target[1] = grab_xy_[1] + wiggle_dy_;
       out.tcp_target[2] = kGraspZ;
-      if (cur_slot_ >= 0 && cur_slot_ < in.n_cubes) {
-        const CubeSlot& c = in.cubes[cur_slot_];
-        out.tcp_target[0] = c.x + wiggle_dx_;
-        out.tcp_target[1] = c.y + wiggle_dy_;
-      }
-      out.grip_target = kGripClosed;
-      if (in.grasped || phase_t_ >= 2.f) {
-        if (in.grasped) {
-          wiggle_tries_ = 0; wiggle_dx_ = wiggle_dy_ = 0.f;
-          in_flight_ = true; flight_slot_ = cur_slot_;
-          start_phase(PH_LIFT, in, out);
-        } else if (wiggle_tries_ < 2) {
-          // grasp-wiggle: shift approach target and retry
+      out.tcp_yaw = grab_yaw_;
+      out.yaw_valid = true;
+      float g;
+      if (out.s < 0.10f) g = kGripPre;
+      else if (out.s < 0.60f)
+        g = kGripPre + (kGripClosed - kGripPre) * (out.s - 0.10f) / 0.5f;
+      else g = kGripClosed;
+      out.grip_target = g;
+      // v1.5.0: leave the grasp only when the pads sit at cube MID-height
+      // (deep) AND the close ramp has finished (clamped). The old rule fired
+      // on the first touch — pads grazed the cube TOP and the lift tore the
+      // immature grip open (cube dropped at lift start).
+      const bool deep = in.tcp_actual[2] < kGraspZ + 0.012f;
+      const bool clamped = g <= kGripClosed + 0.004f && phase_t_ >= 0.55f;
+      if (in.grasped && deep && clamped) {
+        wiggle_tries_ = 0; wiggle_dx_ = wiggle_dy_ = 0.f;
+        in_flight_ = true; flight_slot_ = cur_slot_;
+        start_phase(PH_LIFT, in, out);
+      } else if (phase_t_ >= 3.f) {
+        if (wiggle_tries_ < 2) {
+          // grasp-wiggle: re-read the (possibly pushed) cube, shift approach
           wiggle_tries_++;
           const float a = 3.1f * (float)wiggle_tries_;
-          wiggle_dx_ = 0.010f * cosf(a);
-          wiggle_dy_ = 0.010f * sinf(a);
+          wiggle_dx_ = 0.012f * cosf(a);
+          wiggle_dy_ = 0.012f * sinf(a);
           slot_tries_[cur_slot_ >= 0 ? cur_slot_ : 0]++;
-          start_phase(PH_HOVER, in, out);
+          if (cur_slot_ >= 0 && cur_slot_ < in.n_cubes) {
+            grab_xy_[0] = in.cubes[cur_slot_].x;
+            grab_xy_[1] = in.cubes[cur_slot_].y;
+            grab_yaw_ = in.cubes[cur_slot_].yaw;
+          }
+          start_phase(PH_DESCEND, in, out);
         } else {
           if (cur_slot_ >= 0 && cur_slot_ < 8) slot_dead_[cur_slot_] = true;
           wiggle_tries_ = 0; wiggle_dx_ = wiggle_dy_ = 0.f;
@@ -196,13 +249,21 @@ void TaskLayer::update(const TaskInput& in, TaskOutput& out) {
 
     case PH_LIFT: {
       out.s = phase_t_ / phase_dur_;
-      if (cur_slot_ >= 0 && cur_slot_ < in.n_cubes) {
-        out.tcp_target[0] = in.cubes[cur_slot_].x;
-        out.tcp_target[1] = in.cubes[cur_slot_].y;
-      }
+      out.tcp_target[0] = grab_xy_[0];
+      out.tcp_target[1] = grab_xy_[1];
       out.tcp_target[2] = kTransZ;
+      out.tcp_yaw = grab_yaw_;
+      out.yaw_valid = true;
       out.grip_target = kGripClosed;
-      if ((out.s >= 1.f && in.tcp_actual[2] > kTransZ - 0.025f) || phase_t_ >= 3.f) {
+      // v1.5.0: if the cube slipped away early in the lift, do NOT fly the
+      // empty gripper to the zone — go home and retry the slot instead.
+      if (!in.grasped && phase_t_ > 0.8f && phase_t_ < 4.6f) {
+        in_flight_ = false; flight_slot_ = -1;
+        start_phase(PH_HOME, in, out);
+        break;
+      }
+      if ((out.s >= 1.f && in.tcp_actual[2] > kTransZ - 0.03f)
+          || phase_t_ >= 6.f) {
         next_color_ = in.n_cubes > 0 && flight_slot_ >= 0 && flight_slot_ < in.n_cubes
                       ? in.cubes[flight_slot_].color : next_color_;
         start_phase(PH_TRANSPORT, in, out);
@@ -216,9 +277,11 @@ void TaskLayer::update(const TaskInput& in, TaskOutput& out) {
       out.tcp_target[0] = zones[col][0];
       out.tcp_target[1] = zones[col][1];
       out.tcp_target[2] = kTransZ;
+      out.tcp_yaw = grab_yaw_;   // hold the grasp yaw while carrying
+      out.yaw_valid = true;
       out.grip_target = kGripClosed;
       const float txy[3] = {out.tcp_target[0], out.tcp_target[1], in.tcp_actual[2]};
-      if ((out.s >= 1.f && dist3(in.tcp_actual, txy) < 0.025f) || phase_t_ >= 4.f)
+      if ((out.s >= 1.f && dist3(in.tcp_actual, txy) < 0.025f) || phase_t_ >= 6.f)
         start_phase(PH_PLACE, in, out);
       break;
     }
@@ -229,8 +292,10 @@ void TaskLayer::update(const TaskInput& in, TaskOutput& out) {
       out.tcp_target[0] = zones[col][0];
       out.tcp_target[1] = zones[col][1];
       out.tcp_target[2] = kPlaceZ0 + zone_stack[col] * kStackDz;
+      out.tcp_yaw = grab_yaw_;
+      out.yaw_valid = true;
       out.grip_target = out.s > 0.6f ? kGripOpen : kGripClosed;
-      if ((out.s >= 1.f && dist3(in.tcp_actual, out.tcp_target) < 0.02f) || phase_t_ >= 3.f) {
+      if ((out.s >= 1.f && dist3(in.tcp_actual, out.tcp_target) < 0.02f) || phase_t_ >= 5.f) {
         if (in_flight_) {
           zone_stack[col]++;
           if (flight_slot_ >= 0 && flight_slot_ < 8) slot_dead_[flight_slot_] = true;

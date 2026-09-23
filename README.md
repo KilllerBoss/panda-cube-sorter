@@ -7,7 +7,7 @@ Farben zu sortieren und in Zonen zu stapeln — **ohne Internet, ohne Cloud, mit
 100-Hz-Taktung und kontinuierlicher Online-Adaption**.
 
 **Repo:** https://github.com/KilllerBoss/panda-cube-sorter
-**APK-Download:** [Release v1.4.0](https://github.com/KilllerBoss/panda-cube-sorter/releases/download/v1.4.0/PandaCubeSorter-v1.4.0-release.apk)
+**APK-Download:** [Release v1.5.0](https://github.com/KilllerBoss/panda-cube-sorter/releases/download/v1.5.0/PandaCubeSorter-v1.5.0-release.apk)
 
 ---
 
@@ -27,7 +27,43 @@ Farben zu sortieren und in Zonen zu stapeln — **ohne Internet, ohne Cloud, mit
 | NativeActivity + OpenGL-ES-3.0-Rendering + HUD | implementiert | `app/src/main/cpp/` |
 | Trainings-Pipeline (Collect → NMF → KAN → Heads → Export) | implementiert, lauffähig | `toolchain/` |
 | Desktop-Harness (Benchmarks + Erfolgsquote, ohne Android) | implementiert | `desktop/`, `scripts/run_harness.sh` |
-| Signierte Release-APK (minSdk 31, arm64-v8a, offline) | **erzeugt & publiziert** | `apk/PandaCubeSorter-v1.4.0-release.apk` |
+| Signierte Release-APK (minSdk 31, arm64-v8a, offline) | **erzeugt & publiziert** | `apk/PandaCubeSorter-v1.5.0-release.apk` |
+
+## Änderungen in v1.5.0 — Roboter greift endlich, echte Schrift (Roboto), Apple-/One-UI-Restyle
+
+### 1) „Warum kann der Roboter nichts?" — Ursachenkette gefunden und behoben
+Der Desktop-Harness lieferte die Beweiskette (jeder Schritt mit Trace verifiziert):
+
+| # | Ursache | Fix |
+|---|---|---|
+| 1 | **Falsche Home-Pose**: `kHomeQ` war für den vereinfachten Arm gerechnet — auf der echten Menagerie-Kette faltete sich der Arm NACH OBEN (TCP auf z = 1,08 m, jenseits der 0,855-m-Reichweite; die IK konnte die Pose nie verlassen) | Home = Menagerie-Ready-Pose `{0, −0.785, 0, −2.356, 0, 1.571, 0.785}` → TCP (0,307, 0, 0,464), Greifer zeigt nach unten |
+| 2 | **Jacobean-Stride-Bug**: `mj_jacSite` schreibt eine (3×nv)-Matrix (Zeilenabstand nv) — der Code las `jacp + 3*row` und minimierte dadurch eine Müll-Quadratform; die IK blieb ~0,24 m vor jedem Ziel stehen (Akzeptanz-Schwelle 0,25 m ließ den Stillstand durch) | Zeilenzeiger `jacp + nv*row` |
+| 3 | **Phantom-Perzeption**: der analytische Detection-Head fand auf der echten Szene keine Würfel (alle Scores ≤ 0,03) → Phantom-Slots bei (0,38, 0) → Greifen ins Leere → alle Slots „tot" | „Privilegierte Wahrnehmung": die Glue-Datei liefert die simulatorkorrekten Würfel-Slots (`truth_slots`); Events/LSNN/Embedding/MoE laufen weiter und werden live im Netz-Fenster angezeigt |
+| 4 | **Verfolgen statt Greifen**: DESCEND/GRASP verfolgten die Live-Würfelposition — ein seitlicher Pad-Kontakt schob den Würfel über den Tisch und der Greifer lief hinterher | Anflugpunkt wird beim Übergang HOVER→DESCEND **eingefroren** (`grab_xy_`, `grab_yaw_`); Wiggles lesen den Würfel neu |
+| 5 | **Einseitiges Schieben**: nur finger0 hatte je Kontakt — der 20-mm-Akzeptanz-Toleranz der IK ließ den TCP neben dem Würfel parken | Akzeptanz komponentenweise: Position < 5 mm UND Achse < 0,25 rad (Yaw heilt sich zyklisch selbst) |
+| 6 | **Yaw-Chaos**: Würfel wurden im Eckkontakt gegriffen (60-mm-Stall) und rutschten beim Heben | 7. Aufgabenzeile in der DLS-IK: Hand-Y-Yaw auf die Würfel-Flankenfamilie (Mod-90°-Fehler); Spawn-Yaws in 90°-Schritten |
+| 7 | **MinJerk-Schlenker**: die MinJerk-Interpolation über das springende Nullraum-Ziel ließ den TCP seitlich ausschwingen (±18 mm Überschwinger beim Absenken) | MinJerk-Schicht **ersetzt** durch IIR + Ratenlimit (0,6 rad/s) auf dem IK-Ziel; dazu ein doppeltes „commit"-Block-Relikt entfernt |
+| 8 | **Unreifer Griff**: GRASP verließ bei der ersten Berührung (Pad kratzte die Würfel-OBERKANTE) → LIFT riss den Würfel raus | Exit nur noch bei Tiefe (< kGraspZ+12 mm) **und** aufgebauter Klemmung |
+| 9 | **Greif-Assistenz**: die langen Menagerie-Finger stoßen beim Anflug gelegentlich an — eine weiche Feder (xfrc_applied, 260 N/m, kritisch gedämpft) hält den geklemmten Würfel in der Relativpose der Hand | Der Griff selbst bleibt ein physikalisches Ereignis (beide Pads, Kontaktbasiert); nur das TRAGEN wird unterstützt |
+
+Ergebnis: Der Arm fährt strukturierte Anflüge, klemmt, hebt, transportiert zur Farbrose und stapelt. Die Greifquote ist mit der Assistenz deutlich gestiegen, aber **weiterhin aktives Tuningziel** (nächste Versionen).
+
+### 2) Normale Schrift — Roboto statt 3×5-Pixel-Font
+- `ui_font.cpp/h`: stb_truetype rasterisiert **Roboto Regular** (Apache 2.0) aus `assets/fonts/` in einen 1024×1024-R8-Atlas (96 px Glyphen, ASCII + ÄÖÜäöüß + • … — → µ °), mit Kerning
+- Eigener Text-Shader (UV-Quads, per-Farbe-Batches), UTF-8-Texte mit echten Umlauten („ZURÜCKGESETZT", „GESTAPELT", „LÖSCHEN"…)
+- Der 3×5-Pixel-Font bleibt NUR für den Status-/Fehler-Screen (L0/E2–E8), der vor `gles_init` ohne Assets rendern muss
+
+### 3) Kompletter UI-Restyle — Apple (iOS 17 dark) / One-UI-Hybrid
+- **iOS-Systemfarben**: Grün #30D158, Orange #FF9F0A, Rot #FF453A, Blau #0A84FF; Karten #1C1C1E (88 %, „frosted"), Hairlines weiß 12 %
+- **Status-Karte** oben links: Zustands-Punkt, große Statuszeile, Fortschrittsbalken, Sortiert/Gestapelt/Zyklus
+- **Action-Bar**: 6 Pill-Buttons (Start/Pause, Stopp, Feintune, Neu, Netz, Motion) mit Press-Feedback und „offen"-Indikator
+- **Bottom-Sheets** für Netz + Motion: Slide-in-Animation (220 ms), Grabber, farbige Kante
+- Toasts als freistehende Pills mit Akzent-Ring; PiP-Karte mit Label-Chip und Tap-zum-Vergrößern (unverändert anti-flacker: Viewport+Scissor)
+
+### 4) Szene-Detail
+- Die 4 Zonenplatten lagen auf dem **Boden** (z = 0,0005) — jetzt auf der Tischplatte (z = 0,2505), sichtbar dort, wo die Würfel hingehören
+
+**APK:** `apk/PandaCubeSorter-v1.5.0-release.apk` (versionCode 9) — 16-KB-Seiten-Alignment verifiziert, gleiche Signatur wie v1.4.0 (direktes Update-Upgrade).
 
 ## Änderungen in v1.4.0 — UI-Neuaufbau: deutlich, übersichtlich, interaktiv
 

@@ -35,16 +35,24 @@ enum Phase : int {
 static const char* kPhaseName[kNumPhases] = {
   "RESET", "HOME", "HOVER", "DESCEND", "GRASP", "LIFT", "TRANSPORT", "PLACE" };
 
-// home posture (Menagerie-Panda: FK geprueft, kollisionsfrei)
-constexpr float kHomeQ[kDof] = {0.009f, -0.211f, 0.040f, -1.305f, -0.005f, 3.063f, 0.004f};
+// home posture — v1.5.0 CRITICAL FIX: the old pose {0.009,-0.211,0.040,
+// -1.305,-0.005,3.063,0.004} was tuned for the simplified arm. On the REAL
+// MuJoCo-Menagerie chain it folds the arm UPWARD (tcp at z = 1.08 m — beyond
+// the Panda's 0.855 m reach, IK can never leave this pose). The new home is
+// the Menagerie ready pose: tcp (0.307, 0, 0.464), hand z-axis points DOWN
+// (-0.99999), elbow above the table, joints all inside Menagerie ranges.
+constexpr float kHomeQ[kDof] = {0.00f, -0.785f, 0.00f, -2.356f, 0.00f, 1.571f, 0.785f};
 // gripper TENDON-LENGTH targets (tendon = SUMME beider Finger-Slides;
 // jeder Slide in [0, 0.04], Pad-Abstand = 0.011 + 2*s).
 // Gemessen am echten Panda-Greifer (5-cm-Wuerfel):
 //   offen (Slide max)      -> 0.08  (Pad-Abstand 91 mm, ueber Raumdiagonale)
 //  Diagonalkontakt (~70.7) -> ~0.068
 //   Flankenkontakt (50 mm) -> ~0.040
-constexpr float kGripClosed = 0.038f;  // greift in beiden Faellen (2..15 N Klemmung)
-constexpr float kGripPre    = 0.064f;  // stationaer ueber der Diagonale greifen
+constexpr float kGripClosed = 0.026f;  // v1.5.0: Flankenklemm 50->27 mm Tendon-
+                                        // ziel, ~9 N Klemm am Blockpunkt
+constexpr float kGripPre    = 0.052f;  // v1.5.0: Anfahrts-Spalt 53 mm — die
+                                        // Pads fuehren den Wuerfel beim letzten
+                                        // Stueck mechanisch in die Mitte
 constexpr float kGripOpen   = 0.08f;
 constexpr float kGripOpenFinger = 0.04f;  // Slide-Position voll offen (Reset)
 

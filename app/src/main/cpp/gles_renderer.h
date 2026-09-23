@@ -1,13 +1,15 @@
 // gles_renderer.h — GLES 3.0 rendering of the MuJoCo scene + event-camera FBO
 #pragma once
+#include <android/asset_manager.h>
 #include <cstdint>
 #include "glue/sim_glue.h"
 #include "pcs/controller.h"
 
 using namespace pcs;
 
-// one-time GL setup (program, buffers); called with the EGL context current
-void gles_init(SimGlue& glue, int win_w, int win_h);
+// one-time GL setup (program, buffers, Roboto glyph atlas); called with the
+// EGL context current
+void gles_init(SimGlue& glue, int win_w, int win_h, AAssetManager* am);
 
 // interactive view (cam_track), rendered at display rate
 void gles_render_view(SimGlue& glue, Controller& ctrl);

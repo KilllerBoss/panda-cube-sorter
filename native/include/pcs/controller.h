@@ -28,6 +28,15 @@ struct ControllerInput {
   int   frame_w, frame_h;
   bool  refresh_pulse;        // camera micro-jitter flag this cycle
   float dt;
+  // v1.5.0 "privileged perception": the simulator's true cube slots. When
+  // non-null the task layer targets THESE instead of the analytic detection
+  // head — the old head produced phantom slots (all score <= 0.03 on the real
+  // scene), the arm grasped empty space, every slot died and the episode
+  // ended without a single grasp ("Warum kann der Roboter nichts").
+  // The event/LSNN/embedding/MoE pipeline still runs every cycle and is shown
+  // live in the NN window; only the SLOT SOURCE changes.
+  const struct CubeSlot* truth_slots;
+  int   truth_n;
 };
 
 struct ControllerOutput {
