@@ -529,7 +529,7 @@ static void ui_render_window_bars(std::vector<float>& ui, int win,
     const float bx0 = wr[0] + 0.082f * W, bx1 = wr[2] - 0.115f * W;
     const float bh = 2.6f * s2;
     for (int i = 0; i < 4; ++i) {
-      const float cy = wr[1] + 0.042f * H + (5 + i) * lh + 2.5f * s2;
+      const float cy = wr[1] + 0.042f * H + (5 + i) * lh + 3.3f * s2;
       float frac = 0.f;
       int col = TOAST_VIOLET;
       if (i == 0) frac = g_nn.emb_norm / 2.0f;
@@ -554,7 +554,7 @@ static void ui_render_window_bars(std::vector<float>& ui, int win,
     // countdown bar (row 5)
     {
       const float bx0 = wr[0] + pad, bx1 = wr[2] - pad;
-      const float cy = wr[1] + 0.042f * H + 5 * lh + 2.5f * s2;
+      const float cy = wr[1] + 0.042f * H + 5 * lh + 3.3f * s2;
       const float bh = 2.6f * s2;
       float frac = 0.f;
       int col = TOAST_TEAL;
@@ -616,7 +616,6 @@ static void ui_render_window_text(int win, const float wr[4], int W, int H,
     const float vw = text_width(l, s2);
     text_quads(t_white, l, wr[2] - pad - vw, row_y(4), s2, W, H);
     // bar rows: label left, value right (bars drawn in _bars)
-    struct BarRow { const char* lbl; char buf[24]; };
     char b0[24], b1[24], b2[24], b3[24];
     snprintf(b0, sizeof b0, "%.3f", g_nn.emb_norm);
     snprintf(b1, sizeof b1, "%.4f", g_nn.free_energy);
@@ -1182,17 +1181,12 @@ void gles_render_hud(const CycleStats& st, const TaskOutput& task) {
     const float* dc = kAcc[scol];
     const float dalpha = g_diag.finetuning ? (blink ? 1.f : 0.35f) : 1.f;
     ui_rect(ui, dot, dc[0], dc[1], dc[2], dalpha, dotR, 0.f, W, H);
-    // row 2: progress bar + counts
-    const float bx0 = card[0] + 0.095f * W, bx1 = card[2] - 0.060f * W;
+    // row 2: progress bar (right of the labels) + counts
+    const float bx0 = card[0] + 0.185f * W, bx1 = card[2] - 0.012f * W;
     const float frac = g_diag.total > 0
                            ? (float)g_diag.sorted / (float)g_diag.total : 0.f;
-    ui_bar(ui, bx0, card[1] + 0.062f * H, bx1 - bx0, 0.020f * H, frac,
+    ui_bar(ui, bx0, card[1] + 0.064f * H, bx1 - bx0, 0.020f * H, frac,
            TOAST_GREEN, W, H);
-    // row 3: mini stacked bar (stacked = sorted placed on zones)
-    const float sfrac = g_diag.total > 0
-                            ? (float)g_diag.stacked / (float)g_diag.total : 0.f;
-    ui_bar(ui, bx0, card[1] + 0.098f * H, bx1 - bx0, 0.014f * H, sfrac,
-           TOAST_BLUE, W, H);
   }
 
   // ---- perf chips (right of the card) ----
@@ -1282,6 +1276,20 @@ void gles_render_hud(const CycleStats& st, const TaskOutput& task) {
     ui_rect(ui, dot, c[0], c[1], c[2], fade, s, 0.f, W, H);
   }
 
+  // pip label chip background (must be part of the pass-1 UI batch)
+  float pip_chip[4] = {0};
+  {
+    float pr[4];
+    ui_pip_rect(pr);
+    const char* lbl = gles_pip_big() ? "KAMERA - TIPPEN ZUM KLEIN" : "KAMERA";
+    const float tw = text_width(lbl, s2);
+    pip_chip[0] = pr[0] + 0.006f * W;
+    pip_chip[1] = pr[3] - 0.036f * H;
+    pip_chip[2] = pip_chip[0] + tw + 2.2f * s2;
+    pip_chip[3] = pr[3] - 0.008f * H;
+    ui_rect(ui, pip_chip, 0.06f, 0.065f, 0.085f, 0.85f, 0.006f * W, 0.f, W, H);
+  }
+
   glUseProgram(g_ui_prog);
   ui_draw(g_ui_vbo, ui);
   glUseProgram(g_hud_prog);
@@ -1333,10 +1341,10 @@ void gles_render_hud(const CycleStats& st, const TaskOutput& task) {
     snprintf(lbuf, sizeof lbuf, "SORTIERT %d/%d", g_diag.sorted, g_diag.total);
     text_quads(t_white, lbuf, card[0] + pad, card[1] + 0.058f * H, s2, W, H);
     snprintf(lbuf, sizeof lbuf, "GESTAPELT %d", g_diag.stacked);
-    text_quads(t_white, lbuf, card[0] + pad, card[1] + 0.094f * H, s2, W, H);
+    text_quads(t_white, lbuf, card[0] + pad, card[1] + 0.098f * H, s2, W, H);
     snprintf(lbuf, sizeof lbuf, "ZYK %ld", g_diag.cycles);
     const float cw = text_width(lbuf, s2);
-    text_quads(t_gray, lbuf, card[2] - pad - cw, card[1] + 0.094f * H, s2, W, H);
+    text_quads(t_gray, lbuf, card[2] - pad - cw, card[1] + 0.098f * H, s2, W, H);
   }
 
   // ---- chips text ----
@@ -1365,16 +1373,11 @@ void gles_render_hud(const CycleStats& st, const TaskOutput& task) {
   if (wopen >= 0) ui_render_window_text(wopen, wr, W, H, s, s2, t_white, t_gray,
                                         t_acc, tnow);
 
-  // ---- pip label chip ----
+  // ---- pip label chip text (rect drawn in pass 1) ----
   {
-    float pr[4];
-    ui_pip_rect(pr);
     const char* lbl = gles_pip_big() ? "KAMERA - TIPPEN ZUM KLEIN" : "KAMERA";
-    const float tw = text_width(lbl, s2);
-    float cr[4] = {pr[0] + 0.006f * W, pr[3] - 0.034f * H,
-                   pr[0] + 0.006f * W + tw + 2.2f * s2, pr[3] - 0.006f * H};
-    ui_rect(ui, cr, 0.06f, 0.065f, 0.085f, 0.85f, 0.006f * W, 0.f, W, H);
-    text_quads(t_gray, lbl, cr[0] + 1.1f * s2, cr[1] + 0.55f * s2, s2, W, H);
+    text_quads(t_gray, lbl, pip_chip[0] + 1.1f * s2, pip_chip[1] + 0.9f * s2,
+               s2, W, H);
   }
 
   // ---- toast text ----
@@ -1412,7 +1415,7 @@ static void ui_window_rect(int which, float r[4]) {
   const int W = g_win_w, H = g_win_h;
   const float s2 = std::max(3.f, H / 150.f);
   const float lh = 6.5f * s2;
-  const int lines = (which == WIN_NN) ? 11 : 7;
+  const int lines = (which == WIN_NN) ? 12 : 7;
   r[0] = 0.014f * W;
   r[1] = 0.170f * H;                       // below the status card
   r[2] = r[0] + 0.46f * W;

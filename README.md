@@ -7,7 +7,7 @@ Farben zu sortieren und in Zonen zu stapeln — **ohne Internet, ohne Cloud, mit
 100-Hz-Taktung und kontinuierlicher Online-Adaption**.
 
 **Repo:** https://github.com/KilllerBoss/panda-cube-sorter
-**APK-Download:** [Release v1.3.0](https://github.com/KilllerBoss/panda-cube-sorter/releases/download/v1.3.0/PandaCubeSorter-v1.3.0-release.apk)
+**APK-Download:** [Release v1.4.0](https://github.com/KilllerBoss/panda-cube-sorter/releases/download/v1.4.0/PandaCubeSorter-v1.4.0-release.apk)
 
 ---
 
@@ -27,7 +27,56 @@ Farben zu sortieren und in Zonen zu stapeln — **ohne Internet, ohne Cloud, mit
 | NativeActivity + OpenGL-ES-3.0-Rendering + HUD | implementiert | `app/src/main/cpp/` |
 | Trainings-Pipeline (Collect → NMF → KAN → Heads → Export) | implementiert, lauffähig | `toolchain/` |
 | Desktop-Harness (Benchmarks + Erfolgsquote, ohne Android) | implementiert | `desktop/`, `scripts/run_harness.sh` |
-| Signierte Release-APK (minSdk 31, arm64-v8a, offline) | **erzeugt & publiziert** | `apk/PandaCubeSorter-v1.3.0-release.apk` |
+| Signierte Release-APK (minSdk 31, arm64-v8a, offline) | **erzeugt & publiziert** | `apk/PandaCubeSorter-v1.4.0-release.apk` |
+
+## Änderungen in v1.4.0 — UI-Neuaufbau: deutlich, übersichtlich, interaktiv
+
+Die komplette Oberfläche wurde neu gestaltet — alles ist klarer lesbar, logisch
+geordnet und reagiert spürbar auf jeden Fingerdruck:
+
+**Neues Design-System**
+- **Abgerundete Glas-Panels** überall (eigener SDF-Shader mit Antialiasing,
+  alle Flächen in einem Draw-Call — die GPU bleibt unterm 10-ms-Budget).
+- **Eine klare Farbsprache:** Grün = Start/Lauf, Amber = Pause, Rot = Stop/
+  Löschen, Orange = Finetune, Blau = Neue Episode, Violett = NN, Tuerkis =
+  Motion. Jede Farbe bedeutet überall dasselbe.
+- **Icons auf den Buttons** (7×7-Pixel-Icons: Play/Pause/Stop/Blitz/Plus/
+  Chip/Wellenform) — man erkennt die Funktion, bevor man liest.
+
+**Logisch geordnete Zonen**
+- **Status-Karte oben links:** farbiger Zustands-Punkt (AKTIV/PAUSIERT/HALT/
+  FINETUNE — blinkt bei Finetune), aktuelle Phase, SORTIERT-Balken mit
+  Zähler, GESTAPELT-Balken, Zyklenzähler.
+- **Perf-Chips oben Mitte:** FPS (EMA), Zykluszeit farbig nach 10-ms-Budget,
+  B/G-Diagnose (EGL-Bind, GL-Fehler).
+- **Roboter-Kamera oben rechts** mit Label-Chip.
+- **Action-Bar unten:** 6 farbcodierte Buttons, START/PAUSE zeigt mit Icon
+  und Farbe den Zustand; offene Fenster markieren ihren Button mit Punkt.
+
+**Spürbar interaktiv**
+- **Press-Feedback:** Antippen lässt den Button schrumpfen und aufleuchten;
+  ausgelöst wird beim **Loslassen** auf dem Button (Handy-Standard — kein
+  Verfehlen mehr, Finger wegziehen bricht ab).
+- **Roboter-Kamera antippen = Großansicht**, nochmal antippen = zurück
+  (Tap-Erkennung: erst bei Bewegung wird aus dem Tap ein Orbit).
+- **Toasts** bestätigen jede Aktion (Start/Pause/Stop/Finetune/Neue Episode/
+  Motion-AUFZ/UMW/TRAIN/Löschen/Kamera-Reset) — mit Farb-Punkt und Fade.
+- **Kamera-Hinweis** beim ersten Start: „1 FINGER DREHEN - 2 FINGER ZOOM“.
+
+**Fenster (NN / MOT) neu**
+- Rotes **X oben rechts** zum Schließen, farbiger Akzentstreifen links,
+  Titel-Zeile, übersichtliche Sektionen.
+- **NN-Fenster mit Live-Balken:** EMB-Norm, FEP-Fehler, MoE-Gewicht und
+  LoRA-η als Balken neben ihren Zahlenwerten; Events/Spikes, V, Stage-
+  Timings; „KAMERA ZURÜCKSETZEN“-Button.
+- **Motion-Fenster mit Fortschritt:** Blink-Punkt und Countdown-Balken bei
+  Aufnahme/Training, CLIPS/SAMPLES/UPDATES-Zeilen, MSG-Zeile, vier farbige
+  Buttons — **LÖSCH verlangt Bestätigung** (erster Tipp: Button wird rot und
+  zeigt „SICHER?“, zweiter Tipp löscht; nach 3 s entwaffnet es sich).
+- **Umlaut-Glyphen** (ä/ö/ü/ß) in der 3×5-Pixelschrift.
+
+**Build:** versionCode 8, `1.4.0`; 16-KB-ELF-Ausrichtung verifiziert
+(PT_LOAD = 0x4000), signiert.
 
 ## Änderungen in v1.3.0 — Frei kamerafähig, Flacker-Ursache behoben, NN-Fenster, Motion-Manager
 
