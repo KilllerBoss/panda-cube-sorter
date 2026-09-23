@@ -282,6 +282,29 @@ void SimGlue::cam_event_pose(float pos[3], float fwd[3], float up[3],
   *fovy = (float)m_->cam_fovy[cam_event_];
 }
 
+// v1.3.0 motion manager: stable snapshot of the arm state. Runs on the loop
+// thread right after step_cycle, BEFORE the next mj_step — reading qpos /
+// site_xpos here is race-free by construction (single loop thread).
+void SimGlue::arm_state(float q[7], float* grip, float tcp[3]) const {
+  if (!m_ || !d_) {
+    memset(q, 0, 7 * sizeof(float));
+    if (grip) *grip = 0.f;
+    if (tcp) memset(tcp, 0, 3 * sizeof(float));
+    return;
+  }
+  for (int j = 0; j < 7; ++j)
+    q[j] = jnt_arm_[j] >= 0 ? (float)d_->qpos[m_->jnt_qposadr[jnt_arm_[j]]] : 0.f;
+  if (grip)
+    *grip = jnt_grip_[0] >= 0 ? (float)d_->qpos[m_->jnt_qposadr[jnt_grip_[0]]]
+                              : 0.f;
+  if (tcp) {
+    if (site_tcp_ >= 0)
+      for (int k = 0; k < 3; ++k) tcp[k] = (float)d_->site_xpos[3 * site_tcp_ + k];
+    else
+      memset(tcp, 0, 3 * sizeof(float));
+  }
+}
+
 void SimGlue::refresh_eval() {
   // grasp detection: both fingers in contact with the same cube geom
   grasped_ = false; contact_l_ = false; contact_r_ = false;

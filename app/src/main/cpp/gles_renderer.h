@@ -47,8 +47,34 @@ enum PcsButton {
   BTN_STOP,        // freeze the arm where it is, open the gripper
   BTN_FINE,        // LoRA finetune burst on the current tracking error
   BTN_NEW,         // new episode: re-randomize 4-8 cubes
+  BTN_NN,          // v1.3.0: toggle the neural-net info window
+  BTN_MOT,         // v1.3.0: toggle the motion-manager window
   BTN_COUNT
 };
+
+// ---------------- v1.3.0 windows (NN info + motion manager) ----------------
+
+enum PcsWindow { WIN_NN = 0, WIN_MOT, WIN_COUNT };
+
+// toggle a window on/off (called directly from the input thread)
+void gles_toggle_window(int which);
+bool gles_window_open(int which);
+
+// hit-test INSIDE the open windows (call AFTER gles_hit_button).
+// returns 0 = no window hit, else an action id:
+//   1 NN close   2 NN camera-reset
+//   3 MOT close  4 MOT record (AUFZ)  5 MOT convert (UMW)
+//   6 MOT train  7 MOT clear (LOESCH)
+int gles_hit_window_button(float x, float y);
+
+// ---------------- v1.3.0 touch camera (orbit / zoom / pan) ----------------
+// one finger drag  -> orbit around the table target
+// two finger pinch -> zoom (dolly)
+// two finger drag  -> pan the look-at target
+void gles_cam_orbit(float d_az, float d_el);
+void gles_cam_zoom(float dist_factor);
+void gles_cam_pan(float dx_screen, float dy_screen, int win_w, int win_h);
+void gles_cam_reset();
 
 // window-coords touch point -> button id, or -1 if none hit
 int gles_hit_button(float x, float y);
@@ -59,6 +85,11 @@ struct PcsUiState {
   bool stop = false;        // STOP pressed
   bool fine = false;        // FINETUNE pressed
   bool new_episode = false; // NEW pressed
+  // v1.3.0 motion-manager actions (MOT window buttons)
+  bool mot_record = false;  // AUFZ: snapshot the last ~2.5 s of joint motion
+  bool mot_convert = false; // UMW: motion clips -> 32-d features + dataset file
+  bool mot_train = false;   // TRAIN: LoRA-Lyapunov updates on the dataset
+  bool mot_clear = false;   // LOESCH: drop all clips + dataset
 };
 PcsUiState gles_take_ui();
 // input thread -> UI flags (OR-accumulated until the loop consumes them)
@@ -74,3 +105,30 @@ void gles_set_diag(int bind, int gl_errs, long cycles, int sorted, int total,
 
 // number of view frames that ended with a GL error (shown as G<n> in HUD)
 int gles_gl_errs();
+
+// ---------------- v1.3.0 live NN + motion state (loop -> window) ----------------
+
+// published by the 100 Hz loop each cycle; shown live in the NN window
+struct PcsNnState {
+  uint32_t events = 0, spikes = 0;
+  float emb_norm = 0.f;        // ||32-d FEP embedding||
+  float free_energy = 0.f;     // predictive-coding error energy
+  float lora_eta = 0.f;        // adaptive Lyapunov gain
+  float lora_v = 0.f;          // V = e^T e (must decrease)
+  float moe_max = 0.f;         // max mixture weight after softmax
+  int   phase = 0;             // task phase id
+  uint32_t t_phys = 0, t_event = 0, t_snn = 0, t_mlp = 0;  // us per stage
+};
+void gles_set_nn(const PcsNnState& s);
+
+// published by the loop after motion-manager actions
+struct PcsMotState {
+  int   clips = 0;             // recorded motion clips
+  int   samples = 0;           // converted 32-d feature samples in the dataset
+  float last_feat_norm = 0.f;  // ||feature|| of the last conversion
+  int   updates = 0;           // LoRA updates done by the last TRAIN press
+  int   rec_left = 0;          // >0: countdown "recording ..." (cycles)
+  int   train_left = 0;        // >0: countdown "training ..." (updates left)
+  char  msg[32] = {0};         // short status text for the MOT window
+};
+void gles_set_motion(const PcsMotState& s);

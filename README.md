@@ -7,7 +7,7 @@ Farben zu sortieren und in Zonen zu stapeln — **ohne Internet, ohne Cloud, mit
 100-Hz-Taktung und kontinuierlicher Online-Adaption**.
 
 **Repo:** https://github.com/KilllerBoss/panda-cube-sorter
-**APK-Download:** [Release v1.2.0](https://github.com/KilllerBoss/panda-cube-sorter/releases/download/v1.2.0/PandaCubeSorter-v1.2.0-release.apk)
+**APK-Download:** [Release v1.3.0](https://github.com/KilllerBoss/panda-cube-sorter/releases/download/v1.3.0/PandaCubeSorter-v1.3.0-release.apk)
 
 ---
 
@@ -27,7 +27,58 @@ Farben zu sortieren und in Zonen zu stapeln — **ohne Internet, ohne Cloud, mit
 | NativeActivity + OpenGL-ES-3.0-Rendering + HUD | implementiert | `app/src/main/cpp/` |
 | Trainings-Pipeline (Collect → NMF → KAN → Heads → Export) | implementiert, lauffähig | `toolchain/` |
 | Desktop-Harness (Benchmarks + Erfolgsquote, ohne Android) | implementiert | `desktop/`, `scripts/run_harness.sh` |
-| Signierte Release-APK (minSdk 31, arm64-v8a, offline) | **erzeugt & publiziert** | `apk/PandaCubeSorter-v1.2.0-release.apk` |
+| Signierte Release-APK (minSdk 31, arm64-v8a, offline) | **erzeugt & publiziert** | `apk/PandaCubeSorter-v1.3.0-release.apk` |
+
+## Änderungen in v1.3.0 — Frei kamerafähig, Flacker-Ursache behoben, NN-Fenster, Motion-Manager
+
+**Neu: die 3D-Welt gehört dir.** Die Szene ist ab jetzt frei erkundbar:
+
+- **Ein Finger ziehen** = Kamera um den Blickpunkt **drehen** (Orbit, azimut + elevation,
+  0,0038 rad/Pixel — ein volle-Bildschirm-Drag dreht gut eine Dreiviertelrunde).
+- **Zwei Finger auseinander/zusammen** = **Zoom** (Dolly, 0,55–4,0 m Orbit-Radius).
+- **Zwei Finger ziehen** = **Verschieben** des Blickpunkts über den Tisch
+  (grab-Stil: die Szene folgt dem Finger; Blickpunkt auf den Arbeitsbereich begrenzt).
+- Berührungen auf Buttons/Fenstern starten **keine** Kamerabewegung; ein Gesten-Abbruch
+  (Finger hoch) springt nicht — die Kamera bleibt, wo sie war.
+
+**Flacker-Ursache gefunden und abgestellt** (Feldbefund: „random kurz wird das
+Kamera-Bild zum Vollbild und verschwindet“): Das PiP-Kamerabild wurde als NDC-Quad
+in Fenster-Pixelkoordinaten gezeichnet. Bei jeder noch so kurzen Inkonsistenz in
+diesen Größen (Resize-Race, Treiberpuffer-Chaos) konnte das Quad kurzzeitig den
+kompletten Bildschirm überdecken. **Der Fix:** Das Bild wird jetzt als
+Fullscreen-Quad **durch ein auf sein Rechteck fixiertes Viewport+Scissor** gezeichnet —
+es kann **physikalisch nicht mehr aus seinem Bereich ausbrechen**, egal was die
+Vertexdaten oder der Treiber machen. Der weiße PiP-Rahmen ist genauso abgeschirmt.
+
+**Neu: NN-Fenster** (Button **NN** in der Buttonleiste) — auf/zu klappbar:
+
+- Architektur auf einen Blick: Event-Kamera 96×72 → 576 Bins, ALIF-LSNN 128 Neuronen,
+  FEP-Embedding 32D, Soft-MoE 8 Prototypen, KAN-MLP 24-8-8 + LoRA R4 (Lyapunov).
+- **Live-Werte aus der laufenden Pipeline:** Events/Spike-Zähler, Embedding-Norm,
+  Free Energy, LoRA-Gain η + Lyapunov-Funktion V, max. MoE-Mischgewicht,
+  aktuelle Task-Phase (HOME/HOVER/DESCEND/GRASP/…), Mikrotimings pro Stufe.
+- Enthält den **KAM**-Button (Kamera auf die Standardansicht zurücksetzen).
+
+**Neu: Motion-Manager** (Button **MOT**) — „das, was die Pipeline macht“, direkt bedienbar:
+
+- **AUFZ**: nimmt die letzten 2,5 s echter Gelenkbewegung auf (Ringpuffer, 250 Samples
+  @ 100 Hz: qpos aller 7 Gelenke + Greifer + TCP-Pfad).
+- **UMW**: wandelt Clips in **32-d-Merkmalsvektoren** um (Joint-Momente: Mittelwert,
+  Betragsmittel, Standardabweichung, Hub — Greifer-Mittel/Hub, TCP-Pfadlänge + Netto-
+  verschiebung; skaliert auf die Embedding-Größenordnung) und speichert sie in
+  `motions.bin` im App-Speicher (überlebt App-Neustart).
+- **TRAIN**: füttert den Datensatz in die **analytischen LoRA-Lyapunov-Updates**
+  (max. 64 Updates pro Druck, η adaptiv, V = eᵀe fällt monoton — abwechslungsfrei
+  stabil, ohne Backpropagation).
+- **LOESCH**: leert Clips + Datensatz. Fenster zeigt Cl-Zähler, Sample-Zähler,
+  Merkmalsnorm, Update-Summe und Statuszeile.
+
+**Weitere Verbesserungen:** Buttonleiste auf 6 Buttons gewachsen
+(START/STOP/FINE/NEU/**NN**/**MOT**, einheitliches Layout für Zeichnung + Hit-Test);
+Tipp auf eine offene Fensterfläche verbraucht die Geste, statt die Szene zu drehen.
+
+**Build:** versionCode 7, `1.3.0`; beide `.so`s erneut mit 16-KB-Page-Ausrichtung
+verifiziert (PT_LOAD = 16384), signiert, zipalign-konform.
 
 ## Änderungen in v1.0.1 — Black-Screen-Fix
 

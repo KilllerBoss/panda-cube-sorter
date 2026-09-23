@@ -1,6 +1,20 @@
 // native_main.cpp — NativeActivity entry point (pure C++, no Java overhead)
 // Panda Cube Sorter — autark Android app for the S26 Ultra.
 //
+// v1.3.0 camera + windows + motion manager:
+//   * full touch camera: ONE finger orbits the scene, TWO fingers pinch-zoom
+//     and pan the look-at target (reset via the NN window "KAM" button)
+//   * flicker root fix (field diagnosis: "Kamera-Bild wird kurz Vollbild"):
+//     the PiP camera image is now drawn as a fullscreen quad THROUGH a
+//     viewport+scissor locked to its rectangle — it can physically never
+//     extend beyond its region again, whatever races the driver throws at it
+//   * NN info window (NN button): architecture summary + live values
+//     (events, spikes, embedding norm, free energy, LoRA eta/V, MoE max,
+//     phase, per-stage micro timings)
+//   * motion manager (MOT button): AUFZ records the last 2.5 s of real joint
+//     motion, UMW converts clips to 32-d features + persists motions.bin,
+//     TRAIN runs analytic LoRA-Lyapunov updates on the dataset, LOESCH clears
+//
 // v1.0.1 black-screen fixes:
 //   * two EGL contexts from ONE share group: the execution-loop thread owns
 //     the event-camera FBO (a context-local object), the worker thread renders
@@ -31,11 +45,13 @@
 #include <GLES3/gl3.h>
 #include <android/asset_manager.h>
 #include <android/log.h>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -84,18 +100,130 @@ static std::vector<uint8_t> g_frame(kEvW * kEvH * 3);
 static AInputQueue* g_queue = nullptr;
 static int looper_callback(int fd, int events, void* data);
 
-// UI flags -> renderer (button hits from the input thread)
-static void handle_touch_down(float x, float y) {
+// UI buttons from the input thread (button hits NEVER become camera gestures)
+static bool handle_ui_touch(float x, float y) {
   const int btn = gles_hit_button(x, y);
-  if (btn < 0) return;  // touches on the scene do nothing (no accidental resets)
-  PcsUiState s;
-  switch (btn) {
-    case BTN_START: s.toggle_run = true; break;
-    case BTN_STOP:  s.stop = true; break;
-    case BTN_FINE:  s.fine = true; break;
-    case BTN_NEW:   s.new_episode = true; break;
+  if (btn >= 0) {
+    PcsUiState s;
+    switch (btn) {
+      case BTN_START: s.toggle_run = true; break;
+      case BTN_STOP:  s.stop = true; break;
+      case BTN_FINE:  s.fine = true; break;
+      case BTN_NEW:   s.new_episode = true; break;
+      case BTN_NN:    gles_toggle_window(WIN_NN); return true;
+      case BTN_MOT:   gles_toggle_window(WIN_MOT); return true;
+      default: return true;
+    }
+    gles_push_ui(s);
+    return true;
   }
-  gles_push_ui(s);
+  const int wb = gles_hit_window_button(x, y);
+  if (wb == 0) return false;              // no UI hit -> camera gesture
+  PcsUiState s;
+  switch (wb) {
+    case 1: gles_toggle_window(WIN_NN); break;      // NN window close
+    case 2: gles_cam_reset(); break;                // NN window: KAM
+    case 3: gles_toggle_window(WIN_MOT); break;     // MOT window close
+    case 4: s.mot_record = true; break;             // AUFZ
+    case 5: s.mot_convert = true; break;            // UMW
+    case 6: s.mot_train = true; break;              // TRAIN
+    case 7: s.mot_clear = true; break;              // LOESCH
+    default: break;                                  // 8: window body
+  }
+  if (wb >= 4 && wb <= 7) gles_push_ui(s);
+  return true;
+}
+
+// ---------------- v1.3.0 touch gestures (orbit / zoom / pan) ----------------
+// One finger drag on the scene  -> orbit the camera around the target.
+// Two finger pinch              -> zoom (dolly). Two finger drag -> pan.
+// Touches on buttons/windows are consumed by handle_ui_touch and never
+// start a gesture. A gesture ENDS when a finger lifts — the surviving
+// finger does not jump the camera (no re-seed guesswork).
+struct Gesture {
+  bool cam = false;      // gesture active (owns the camera)
+  bool two = false;      // two-finger mode
+  float lx = 0, ly = 0;  // last single-finger position
+  float p0x = 0, p0y = 0, p1x = 0, p1y = 0;  // last two-finger positions
+  float last_dist = 0.f; // last pinch distance
+  float lmx = 0, lmy = 0;  // last midpoint
+};
+static Gesture g_gest;
+
+static void handle_motion_event(AInputEvent* ev) {
+  const int32_t action = AMotionEvent_getAction(ev);
+  const int32_t plain = action & AMOTION_EVENT_ACTION_MASK;
+  const int n = (int)AMotionEvent_getPointerCount(ev);
+
+  switch (plain) {
+    case AMOTION_EVENT_ACTION_DOWN: {
+      const float x = AMotionEvent_getX(ev, 0);
+      const float y = AMotionEvent_getY(ev, 0);
+      if (handle_ui_touch(x, y)) { g_gest = Gesture{}; return; }
+      g_gest.cam = true;
+      g_gest.two = false;
+      g_gest.lx = x; g_gest.ly = y;
+      return;
+    }
+    case AMOTION_EVENT_ACTION_POINTER_DOWN: {
+      if (g_gest.cam && n >= 2) {
+        // switch to two-finger mode: seed pinch + pan reference
+        g_gest.two = true;
+        g_gest.p0x = AMotionEvent_getX(ev, 0);
+        g_gest.p0y = AMotionEvent_getY(ev, 0);
+        g_gest.p1x = AMotionEvent_getX(ev, 1);
+        g_gest.p1y = AMotionEvent_getY(ev, 1);
+        const float dx = g_gest.p1x - g_gest.p0x;
+        const float dy = g_gest.p1y - g_gest.p0y;
+        g_gest.last_dist = sqrtf(dx * dx + dy * dy);
+        g_gest.lmx = 0.5f * (g_gest.p0x + g_gest.p1x);
+        g_gest.lmy = 0.5f * (g_gest.p0y + g_gest.p1y);
+      }
+      return;
+    }
+    case AMOTION_EVENT_ACTION_MOVE: {
+      if (!g_gest.cam) return;
+      if (!g_gest.two) {
+        if (n < 1) return;
+        const float x = AMotionEvent_getX(ev, 0);
+        const float y = AMotionEvent_getY(ev, 0);
+        const float dx = x - g_gest.lx, dy = y - g_gest.ly;
+        g_gest.lx = x; g_gest.ly = y;
+        // 0.0038 rad/px: a full-screen drag turns the scene ~1.3x
+        gles_cam_orbit(dx * 0.0038f, dy * 0.0038f);
+      } else {
+        if (n < 2) return;
+        const float x0 = AMotionEvent_getX(ev, 0);
+        const float y0 = AMotionEvent_getY(ev, 0);
+        const float x1 = AMotionEvent_getX(ev, 1);
+        const float y1 = AMotionEvent_getY(ev, 1);
+        const float dx = x1 - x0, dy = y1 - y0;
+        const float d = sqrtf(dx * dx + dy * dy);
+        const float mx = 0.5f * (x0 + x1), my = 0.5f * (y0 + y1);
+        if (g_gest.last_dist > 1.f && d > 1.f) {
+          // fingers apart (d grows) -> factor < 1 -> dolly IN
+          gles_cam_zoom(g_gest.last_dist / d);
+          gles_cam_pan(mx - g_gest.lmx, my - g_gest.lmy, gles_win_w(),
+                       gles_win_h());
+        }
+        g_gest.p0x = x0; g_gest.p0y = y0;
+        g_gest.p1x = x1; g_gest.p1y = y1;
+        g_gest.last_dist = d;
+        g_gest.lmx = mx; g_gest.lmy = my;
+      }
+      return;
+    }
+    case AMOTION_EVENT_ACTION_POINTER_UP:
+      // a two-finger gesture loses a finger -> end it completely
+      g_gest = Gesture{};
+      return;
+    case AMOTION_EVENT_ACTION_UP:
+    case AMOTION_EVENT_ACTION_CANCEL:
+      g_gest = Gesture{};
+      return;
+    default:
+      return;
+  }
 }
 
 // ------------------------ diagnostics ------------------------
@@ -285,7 +413,7 @@ static void write_error_report(int err) {
   FILE* f = fopen(p.c_str(), "w");
   if (!f) return;
   fprintf(f,
-          "PandaCubeSorter v1.2.0 | init error %d | sub 0x%X\n"
+          "PandaCubeSorter v1.3.0 | init error %d | sub 0x%X\n"
           "2=scene.mjb missing 3=weights.bin missing 4=storage write failed\n"
           "5=MJB load failed 6=weights invalid 7=EGL failed\n"
           "loop bind=%d (0=surfaceless 1=pbuffer 2=none)",
@@ -295,6 +423,221 @@ static void write_error_report(int err) {
     if (!g_diag.empty()) fprintf(f, "--- diag ---\n%s", g_diag.c_str());
   }
   fclose(f);
+}
+
+// ------------------------ v1.3.0 motion manager ------------------------
+// The user-facing "what you did with the pipeline" panel:
+//   AUFZ  — keep the last 2.5 s of real MuJoCo joint motion as a clip
+//   UMW   — convert clips into 32-d feature samples (the same 32-d scale the
+//           FEP embedding lives on) and persist them to motions.bin
+//   TRAIN — Lyapunov LoRA updates on the converted dataset (analytic,
+//           divergence-free — same rule as the FINETUNE button)
+//   LOESCH— drop clips + dataset
+// All state lives on the loop thread; the renderer only gets copies.
+struct MotSample {           // 11 floats, POD — persisted as-is
+  float q[7];
+  float grip;
+  float tcp[3];
+};
+struct MotClip {
+  std::vector<MotSample> s;
+  bool converted = false;
+};
+static constexpr int kRingCap = 250;   // 2.5 s at 100 Hz
+static std::vector<MotSample> g_ring;
+static size_t g_ring_head = 0;
+static std::vector<MotClip> g_clips;
+static std::vector<std::array<float, 32>> g_dataset;
+static int g_mot_updates = 0;
+static float g_mot_last_norm = 0.f;
+static char g_mot_msg[32] = "BEREIT";
+static float g_last_h1[kMlpHidden] = {0};   // last MLP hidden state (loop)
+
+static void mot_save();
+static void mot_load();
+
+static void mot_ring_push(const MotSample& s) {
+  if ((int)g_ring.size() < kRingCap) {
+    g_ring.push_back(s);
+  } else {
+    g_ring[g_ring_head] = s;
+  }
+  g_ring_head = (g_ring_head + 1) % kRingCap;
+}
+
+static std::vector<MotSample> mot_ring_take() {
+  std::vector<MotSample> out;
+  const size_t n = g_ring.size();
+  if (n == 0) return out;
+  out.reserve(n);
+  if (n < (size_t)kRingCap) {
+    out = g_ring;
+  } else {
+    for (size_t i = 0; i < n; ++i) out.push_back(g_ring[(g_ring_head + i) % n]);
+  }
+  return out;
+}
+
+// clips -> 32-d features (joint moments + gripper + tcp geometry), all
+// normalized to the FEP embedding scale (~unit)
+static void mot_convert_all() {
+  int fresh = 0;
+  for (auto& c : g_clips) {
+    if (c.converted || c.s.size() < 8) continue;
+    std::array<float, 32> f{};
+    const float n = (float)c.s.size();
+    for (int j = 0; j < 7; ++j) {
+      float mean = 0, amean = 0, mn = 1e9f, mx = -1e9f;
+      for (const auto& s : c.s) {
+        const float v = s.q[j];
+        mean += v; amean += fabsf(v);
+        mn = std::min(mn, v); mx = std::max(mx, v);
+      }
+      mean /= n; amean /= n;
+      float var = 0;
+      for (const auto& s : c.s) { const float d = s.q[j] - mean; var += d * d; }
+      var /= n;
+      f[(size_t)j * 4 + 0] = mean / 3.f;       // Panda joint range ~ +-3 rad
+      f[(size_t)j * 4 + 1] = amean / 3.f;
+      f[(size_t)j * 4 + 2] = sqrtf(var);
+      f[(size_t)j * 4 + 3] = (mx - mn) / 3.f;
+    }
+    {   // gripper: mean + range (slide range 0..0.04)
+      float mean = 0, mn = 1e9f, mx = -1e9f;
+      for (const auto& s : c.s) {
+        mean += s.grip;
+        mn = std::min(mn, s.grip); mx = std::max(mx, s.grip);
+      }
+      mean /= n;
+      f[28] = mean / 0.04f;
+      f[29] = (mx - mn) / 0.04f;
+    }
+    {   // tcp: path length + net displacement (typical reach ~0.5 m)
+      float path = 0;
+      float net[3] = {0, 0, 0};
+      for (size_t i = 1; i < c.s.size(); ++i) {
+        for (int k = 0; k < 3; ++k) {
+          const float d = c.s[i].tcp[k] - c.s[i - 1].tcp[k];
+          path += fabsf(d);
+          net[k] += d;
+        }
+      }
+      f[30] = path / 0.5f;
+      f[31] = sqrtf(net[0]*net[0] + net[1]*net[1] + net[2]*net[2]) / 0.5f;
+    }
+    g_dataset.push_back(f);
+    float nrm = 0;
+    for (float v : f) nrm += v * v;
+    g_mot_last_norm = sqrtf(nrm);
+    c.converted = true;
+    ++fresh;
+  }
+  if (fresh > 0) {
+    snprintf(g_mot_msg, sizeof g_mot_msg, "UMW: %d NEU (%u)", fresh,
+             (unsigned)g_dataset.size());
+    mot_save();
+  } else {
+    snprintf(g_mot_msg, sizeof g_mot_msg, "NICHTS NEU ZUM UMWANDELN");
+  }
+}
+
+// LoRA-Lyapunov training burst over the converted dataset
+static void mot_train(Controller& c) {
+  if (g_dataset.empty()) {
+    snprintf(g_mot_msg, sizeof g_mot_msg, "ERST UMWANDELN (UMW)");
+    return;
+  }
+  int updates = 0;
+  for (const auto& f : g_dataset) {
+    // the clip's mean posture, scaled into the tracking-error space the
+    // Lyapunov rule expects (eta adapts, V = e^T e provably decreases)
+    float e[kDof];
+    for (int j = 0; j < kDof; ++j)
+      e[j] = f[(size_t)j * 4 + 0] * 0.3f;
+    c.lora.update(e, g_last_h1, c.lora_st, c.w);
+    ++updates;
+    if (updates >= 64) break;   // bounded burst per press
+  }
+  g_mot_updates += updates;
+  snprintf(g_mot_msg, sizeof g_mot_msg, "TRAIN: %d UPDATES", updates);
+}
+
+static void mot_save() {
+  if (!g_activity || !g_activity->internalDataPath) return;
+  const std::string p =
+      std::string(g_activity->internalDataPath) + "/motions.bin";
+  FILE* f = fopen(p.c_str(), "wb");
+  if (!f) return;
+  const char magic[8] = "PCSMOT1";
+  fwrite(magic, 1, 8, f);
+  const uint32_t nc = (uint32_t)g_clips.size();
+  const uint32_t ns = (uint32_t)g_dataset.size();
+  fwrite(&nc, 4, 1, f);
+  fwrite(&ns, 4, 1, f);
+  for (const auto& c : g_clips) {
+    const uint32_t n = (uint32_t)c.s.size();
+    fwrite(&n, 4, 1, f);
+    if (n) fwrite(c.s.data(), sizeof(MotSample), n, f);
+  }
+  for (const auto& s : g_dataset) fwrite(s.data(), sizeof(float), 32, f);
+  fclose(f);
+}
+
+static void mot_load() {
+  if (!g_activity || !g_activity->internalDataPath) return;
+  const std::string p =
+      std::string(g_activity->internalDataPath) + "/motions.bin";
+  FILE* f = fopen(p.c_str(), "rb");
+  if (!f) return;
+  char magic[8] = {0};
+  uint32_t nc = 0, ns = 0;
+  if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "PCSMOT1", 8) != 0 ||
+      fread(&nc, 4, 1, f) != 1 || fread(&ns, 4, 1, f) != 1 || nc > 64 ||
+      ns > 4096) {
+    fclose(f);
+    return;
+  }
+  g_clips.clear();
+  g_dataset.clear();
+  bool ok = true;
+  for (uint32_t i = 0; i < nc && ok; ++i) {
+    uint32_t n = 0;
+    MotClip c;
+    if (fread(&n, 4, 1, f) != 1 || n > 4096) { ok = false; break; }
+    c.s.resize(n);
+    if (n && fread(c.s.data(), sizeof(MotSample), n, f) != n) { ok = false; break; }
+    c.converted = true;
+    g_clips.push_back(std::move(c));
+  }
+  for (uint32_t i = 0; i < ns && ok; ++i) {
+    std::array<float, 32> s{};
+    if (fread(s.data(), sizeof(float), 32, f) != 32) { ok = false; break; }
+    g_dataset.push_back(s);
+  }
+  fclose(f);
+  if (!ok) { g_clips.clear(); g_dataset.clear(); return; }
+  snprintf(g_mot_msg, sizeof g_mot_msg, "GELADEN: %u CLIPS", nc);
+}
+
+static void mot_clear_all() {
+  g_clips.clear();
+  g_dataset.clear();
+  g_mot_updates = 0;
+  g_mot_last_norm = 0.f;
+  mot_save();
+  snprintf(g_mot_msg, sizeof g_mot_msg, "GELOSCHT");
+}
+
+static void mot_publish() {
+  PcsMotState m;
+  m.clips = (int)g_clips.size();
+  m.samples = (int)g_dataset.size();
+  m.last_feat_norm = g_mot_last_norm;
+  m.updates = g_mot_updates;
+  m.rec_left = 0;
+  m.train_left = 0;
+  snprintf(m.msg, sizeof m.msg, "%s", g_mot_msg);
+  gles_set_motion(m);
 }
 
 // ------------------------ the 100 Hz execution loop ------------------------
@@ -367,6 +710,7 @@ static void execution_loop() {
   gles_publish_poses(g_glue.model(), g_glue.data());  // view shows the scene immediately
   g_ctrl.reset();
   g_err = ST_RUNNING;
+  mot_load();  // v1.3.0: restore the motion dataset from motions.bin
 
   auto next = std::chrono::steady_clock::now();
   const auto period = std::chrono::microseconds(10000);  // 100 Hz
@@ -376,7 +720,7 @@ static void execution_loop() {
   while (g_running && g_has_surface) {
     next += period;
 
-    // ---- UI buttons (START/PAUSE, STOP, FINE, NEW) ----
+    // ---- UI buttons (START/PAUSE, STOP, FINE, NEW, MOT-*) ----
     const PcsUiState ui = gles_take_ui();
     if (ui.toggle_run) {
       const bool now = !g_paused.load();
@@ -394,6 +738,23 @@ static void execution_loop() {
       LOGI("button: FINETUNE burst");
     }
     if (ui.new_episode) g_new_episode = true;
+    if (ui.mot_record) {
+      // v1.3.0: snapshot the last 2.5 s of real joint motion
+      MotClip c;
+      c.s = mot_ring_take();
+      if (!c.s.empty()) {
+        g_clips.push_back(std::move(c));
+        snprintf(g_mot_msg, sizeof g_mot_msg, "AUFZ: %u SAMPLES",
+                 (unsigned)g_clips.back().s.size());
+        LOGI("motion: recorded %u samples (%u clips)",
+             (unsigned)g_clips.back().s.size(), (unsigned)g_clips.size());
+      } else {
+        snprintf(g_mot_msg, sizeof g_mot_msg, "NOCH KEINE BEWEGUNG");
+      }
+    }
+    if (ui.mot_convert) mot_convert_all();
+    if (ui.mot_train) mot_train(g_ctrl);
+    if (ui.mot_clear) mot_clear_all();
 
     if (g_new_episode.exchange(false)) {
       ++episode;
@@ -421,7 +782,34 @@ static void execution_loop() {
       refresh = (cyc % 50) == 49;  // micro-jitter pulse every 0.5 s
       out_stats_set(out.stats);
       out_task_set(out.task);
+
+      // ---- v1.3.0: motion ring buffer + NN live state ----
+      MotSample ms;
+      g_glue.arm_state(ms.q, &ms.grip, ms.tcp);
+      mot_ring_push(ms);
+      memcpy(g_last_h1, out.mlp.h1, sizeof(g_last_h1));
+      {
+        PcsNnState nn;
+        nn.events = out.events.n_events;
+        nn.spikes = out.snn.n_spikes;
+        float en = 0.f;
+        for (int i = 0; i < kEmbDim; ++i) en += out.emb[i] * out.emb[i];
+        nn.emb_norm = sqrtf(en);
+        nn.free_energy = out.free_energy;
+        nn.lora_eta = g_ctrl.lora_st.eta;
+        nn.lora_v = g_ctrl.lora_st.v_prev;
+        float mx = 0.f;
+        for (int i = 0; i < kMlpOut; ++i) mx = std::max(mx, out.mlp.w[i]);
+        nn.moe_max = mx;
+        nn.phase = out.task.phase;
+        nn.t_phys = out.stats.t_phys;
+        nn.t_event = out.stats.t_event;
+        nn.t_snn = out.stats.t_snn;
+        nn.t_mlp = out.stats.t_mlp;
+        gles_set_nn(nn);
+      }
     }
+    mot_publish();
     gles_set_diag((int)g_loop_bind, gles_gl_errs(), (long)cyc,
                   g_glue.sorted_count(), g_glue.total_cubes(),
                   g_glue.stacked_count(), g_paused.load(), g_glue.halted(),
@@ -495,10 +883,8 @@ static int looper_callback(int fd, int events, void* data) {
   AInputQueue* queue = (AInputQueue*)data;
   AInputEvent* ev = nullptr;
   while (AInputQueue_getEvent(queue, &ev) >= 0) {
-    if (AInputEvent_getType(ev) == AINPUT_EVENT_TYPE_MOTION &&
-        AMotionEvent_getAction(ev) == AMOTION_EVENT_ACTION_DOWN) {
-      handle_touch_down(AMotionEvent_getX(ev, 0), AMotionEvent_getY(ev, 0));
-    }
+    if (AInputEvent_getType(ev) == AINPUT_EVENT_TYPE_MOTION)
+      handle_motion_event(ev);
     AInputQueue_finishEvent(queue, ev, 1);
   }
   return 1;

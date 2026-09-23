@@ -24,6 +24,12 @@ static void gles_draw_pip();
 static void text_quads(std::vector<float>& v, const char* s, float x0,
                        float y0, float scale, int win_w, int win_h);
 static float text_width(const char* s, float scale);
+// shared bottom-bar button layout (defined in the touch-buttons section)
+void ui_button_rect(int i, float r[4]);
+// v1.3.0 overlay windows (NN info + motion manager)
+static void ui_window_rect(int which, float r[4]);
+static bool ui_window_button_rect(int win, int btn, float r[4]);
+static void gles_render_windows();
 
 // UI/diag state — written by input + loop threads, read by the view thread.
 // Guarded by one small mutex; contention is negligible (few writes/cycle).
@@ -37,6 +43,90 @@ struct DiagState {
   bool paused = false, halted = false, finetuning = false;
 };
 static DiagState g_diag;
+
+// ---------------- v1.3.0 touch camera (orbit / zoom / pan) ----------------
+struct ViewState {
+  float az = 2.46f;     // orbit azimuth (rad) — default = the v1.2 viewpoint
+  float el = 0.417f;    // orbit elevation (rad)
+  float dist = 1.62f;   // orbit radius (m)
+  float tx = 0.42f, ty = 0.f, tz = 0.30f;  // look-at target
+};
+static ViewState g_cam;
+static std::mutex g_cam_mtx;
+
+static const float kCamAz0 = 2.46f, kCamEl0 = 0.417f, kCamDist0 = 1.62f;
+static const float kCamT0[3] = {0.42f, 0.f, 0.30f};
+
+void gles_cam_orbit(float d_az, float d_el) {
+  std::lock_guard<std::mutex> lk(g_cam_mtx);
+  g_cam.az += d_az;
+  g_cam.el = clampf(g_cam.el + d_el, 0.10f, 1.40f);
+}
+void gles_cam_zoom(float dist_factor) {
+  std::lock_guard<std::mutex> lk(g_cam_mtx);
+  g_cam.dist = clampf(g_cam.dist * dist_factor, 0.55f, 4.0f);
+}
+void gles_cam_pan(float dx_screen, float dy_screen, int win_w, int win_h) {
+  if (win_w < 1 || win_h < 1) return;
+  std::lock_guard<std::mutex> lk(g_cam_mtx);
+  // camera basis (up = world z)
+  const float ce = cosf(g_cam.el), se = sinf(g_cam.el);
+  const float ca = cosf(g_cam.az), sa = sinf(g_cam.az);
+  float fwd[3] = {-ce * sa, -ce * ca, -se};   // eye -> target
+  float fl = sqrtf(fwd[0]*fwd[0] + fwd[1]*fwd[1] + fwd[2]*fwd[2]) + 1e-9f;
+  for (float& v : fwd) v /= fl;
+  // right = normalize(fwd x up_world)
+  float right[3] = {fwd[1] * 1.f - fwd[2] * 0.f, fwd[2] * 0.f - fwd[0] * 1.f, 0.f};
+  // (fwd x (0,0,1)) = (fwd.y, -fwd.x, 0)
+  right[0] = fwd[1]; right[1] = -fwd[0]; right[2] = 0.f;
+  float rl = sqrtf(right[0]*right[0] + right[1]*right[1]) + 1e-9f;
+  right[0] /= rl; right[1] /= rl;
+  float camup[3] = {right[1]*fwd[2] - right[2]*fwd[1],
+                    right[2]*fwd[0] - right[0]*fwd[2],
+                    right[0]*fwd[1] - right[1]*fwd[0]};
+  // pan speed scales with orbit radius (constant screen-space speed)
+  const float k = 0.0022f * g_cam.dist;
+  // screen x grows right, screen y grows DOWN (Android): dragging the scene
+  // with two fingers moves the look-at opposite to the finger motion
+  g_cam.tx += (-right[0] * dx_screen + camup[0] * dy_screen) * k;
+  g_cam.ty += (-right[1] * dx_screen + camup[1] * dy_screen) * k;
+  g_cam.tz += (                              camup[2] * dy_screen) * k;
+  g_cam.tx = clampf(g_cam.tx, -0.4f, 1.3f);
+  g_cam.ty = clampf(g_cam.ty, -0.8f, 0.8f);
+  g_cam.tz = clampf(g_cam.tz, 0.05f, 0.9f);
+}
+void gles_cam_reset() {
+  std::lock_guard<std::mutex> lk(g_cam_mtx);
+  g_cam.az = kCamAz0; g_cam.el = kCamEl0; g_cam.dist = kCamDist0;
+  g_cam.tx = kCamT0[0]; g_cam.ty = kCamT0[1]; g_cam.tz = kCamT0[2];
+}
+
+// ---------------- v1.3.0 windows + live NN/motion state ----------------
+static std::atomic<bool> g_win_open[WIN_COUNT]{false, false};
+
+void gles_toggle_window(int which) {
+  if (which < 0 || which >= WIN_COUNT) return;
+  const bool make_open = !g_win_open[which].load();
+  // only one window open at a time — they share the same screen region
+  for (int i = 0; i < WIN_COUNT; ++i) g_win_open[i] = false;
+  g_win_open[which] = make_open;
+}
+bool gles_window_open(int which) {
+  return (which >= 0 && which < WIN_COUNT) ? g_win_open[which].load() : false;
+}
+
+static PcsNnState g_nn;
+static PcsMotState g_mot;
+// g_nn/g_mot are PODs written by the loop, read by the view — guarded by
+// g_ui_mtx together with the diag state (same contention profile)
+void gles_set_nn(const PcsNnState& s) {
+  std::lock_guard<std::mutex> lk(g_ui_mtx);
+  g_nn = s;
+}
+void gles_set_motion(const PcsMotState& s) {
+  std::lock_guard<std::mutex> lk(g_ui_mtx);
+  g_mot = s;
+}
 
 // view frames that ended with a GL error (HUD "G<n>")
 static std::atomic<int> g_gl_errs{0};
@@ -571,8 +661,17 @@ void gles_render_view(SimGlue& glue, Controller& ctrl) {
 
   if (have_poses) {
     glUseProgram(g_prog);
-    float eye[3] = {1.35f, -1.15f, 0.95f}, ctr[3] = {0.42f, 0.f, 0.30f},
-          up[3] = {0, 0, 1};
+    // v1.3.0 orbit camera: az/el/dist/target steered by touch gestures
+    // (1 finger = orbit, 2 fingers = pinch zoom + pan). Default pose equals
+    // the fixed v1.2 viewpoint.
+    ViewState cam;
+    { std::lock_guard<std::mutex> lk(g_cam_mtx); cam = g_cam; }
+    const float ce = cosf(cam.el), se = sinf(cam.el);
+    const float ca = cosf(cam.az), sa = sinf(cam.az);
+    float eye[3] = {cam.tx + cam.dist * ce * sa, cam.ty + cam.dist * ce * ca,
+                    cam.tz + cam.dist * se};
+    float ctr[3] = {cam.tx, cam.ty, cam.tz};
+    float up[3] = {0, 0, 1};
     Mat4 view = Mat4::lookAt(eye, ctr, up);
     Mat4 proj = Mat4::perspective(50.f * (float)M_PI / 180.f,
                                   (float)W / H, 0.05f, 10.f);
@@ -619,25 +718,13 @@ void gles_render_hud(const CycleStats& st, const TaskOutput& task) {
   if (g_huPos < 0 || g_hud_prog == 0) return;
   const int W = g_win_w, H = g_win_h;
 
-  // ---- shared button layout (top-left origin, same space as touches) ----
-  auto button_rect = [&](int i, float r[4]) {
-    const float m = 0.018f * W;
-    const float gap = 0.014f * W;
-    const float bw = (W - 2 * m - 3 * gap) / 4.f;
-    const float bh = 0.115f * H;
-    r[0] = m + i * (bw + gap);
-    r[1] = H - bh - 0.018f * H;
-    r[2] = r[0] + bw;
-    r[3] = r[1] + bh;
-  };
-
   glUseProgram(g_hud_prog);
 
   // ---- batch 1: button fills + budget bar (dark, then accent) ----
   std::vector<float> v;
   for (int i = 0; i < BTN_COUNT; ++i) {
     float r[4];
-    button_rect(i, r);
+    ui_button_rect(i, r);
     const float xa = 2.f * r[0] / W - 1.f, xb = 2.f * r[2] / W - 1.f;
     const float ya = 1.f - 2.f * r[1] / H, yb = 1.f - 2.f * r[3] / H;
     v.insert(v.end(), {xa, ya, xb, ya, xb, yb});
@@ -660,7 +747,7 @@ void gles_render_hud(const CycleStats& st, const TaskOutput& task) {
   v.clear();
   {
     float r[4];
-    button_rect(BTN_START, r);
+    ui_button_rect(BTN_START, r);
     const float xa = 2.f * r[0] / W - 1.f, xb = 2.f * r[2] / W - 1.f;
     const float ya = 1.f - 2.f * (r[3] - 0.012f * H) / H, yb = 1.f - 2.f * r[3] / H;
     v.insert(v.end(), {xa, ya, xb, ya, xb, yb});
@@ -680,13 +767,15 @@ void gles_render_hud(const CycleStats& st, const TaskOutput& task) {
   // ---- batch 3: white text (labels, diag, counters) ----
   const float s = std::max(3.f, H / 90.f);  // glyph pixel scale
   v.clear();
-  static const char* kLabels[BTN_COUNT][2] = {
-      {"START", "PAUSE"}, {"STOP", "STOP"}, {"FINE", "FINE"}, {"NEU", "NEU"}};
+  static const char* kLabels[BTN_COUNT] = {"START", "STOP", "FINE", "NEU",
+                                           "NN", "MOT"};
   for (int i = 0; i < BTN_COUNT; ++i) {
     float r[4];
-    button_rect(i, r);
-    const char* lbl = kLabels[i][g_diag.paused && i == BTN_START ? 1 : 0];
+    ui_button_rect(i, r);
+    const char* lbl = kLabels[i];
     if (i == BTN_START) lbl = g_diag.paused ? "START" : "PAUSE";
+    if (i == BTN_NN && gles_window_open(WIN_NN)) lbl = "NN X";
+    if (i == BTN_MOT && gles_window_open(WIN_MOT)) lbl = "MOT X";
     const float tw = text_width(lbl, s);
     text_quads(v, lbl, (r[0] + r[2]) * 0.5f - tw * 0.5f,
                (r[1] + r[3]) * 0.5f - 2.5f * s, s, W, H);
@@ -705,6 +794,211 @@ void gles_render_hud(const CycleStats& st, const TaskOutput& task) {
   text_quads(v, l2, 0.02f * W, 0.03f * H, s, W, H);
   glUniform4f(g_huColor, 1.f, 1.f, 1.f, 1.f);
   stream_draw_2f(g_hud_vbo, g_huPos, v);
+
+  // ---- v1.3.0: overlay windows (NN info / motion manager) ----
+  gles_render_windows();
+}
+
+// ---------------- v1.3.0 overlay windows (NN info / motion manager) ----------------
+// Pixel coords are TOP-left origin (same convention as touches + text).
+
+static void push_rect(std::vector<float>& v, const float r[4], int W, int H) {
+  const float xa = 2.f * r[0] / W - 1.f, xb = 2.f * r[2] / W - 1.f;
+  const float ya = 1.f - 2.f * r[1] / H, yb = 1.f - 2.f * r[3] / H;
+  v.insert(v.end(), {xa, ya, xb, ya, xb, yb});
+  v.insert(v.end(), {xa, ya, xb, yb, xa, yb});
+}
+
+static void ui_window_rect(int which, float r[4]) {
+  const int W = g_win_w, H = g_win_h;
+  const float s2 = std::max(3.f, H / 140.f);
+  const float lh = 6.5f * s2;              // text line height
+  const int lines = (which == WIN_NN) ? 12 : 9;
+  r[0] = 0.02f * W;
+  r[1] = 0.115f * H;
+  r[2] = r[0] + 0.42f * W;
+  r[3] = r[1] + lines * lh + 0.105f * H;   // text + button row + margins
+  if (r[3] > H - 0.155f * H) r[3] = H - 0.155f * H;  // keep above the bar
+}
+
+static bool ui_window_button_rect(int win, int btn, float r[4]) {
+  const int W = g_win_w, H = g_win_h;
+  const int n = (win == WIN_NN) ? 2 : 5;
+  if (btn < 0 || btn >= n) return false;
+  float wr[4];
+  ui_window_rect(win, wr);
+  const float m = 0.008f * W;
+  const float gap = 0.006f * W;
+  const float bh = 0.052f * H;
+  const float bw = ((wr[2] - wr[0]) - 2 * m - (n - 1) * gap) / (float)n;
+  r[0] = wr[0] + m + btn * (bw + gap);
+  r[1] = wr[3] - bh - 0.010f * H;
+  r[2] = r[0] + bw;
+  r[3] = r[1] + bh;
+  return true;
+}
+
+int gles_hit_window_button(float x, float y) {
+  for (int w = 0; w < WIN_COUNT; ++w) {
+    if (!gles_window_open(w)) continue;
+    float wr[4];
+    ui_window_rect(w, wr);
+    const int n = (w == WIN_NN) ? 2 : 5;
+    for (int b = 0; b < n; ++b) {
+      float r[4];
+      if (!ui_window_button_rect(w, b, r)) continue;
+      if (x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3]) {
+        if (w == WIN_NN) return b == 0 ? 1 : 2;   // 1 close, 2 cam reset
+        return 3 + b;  // 3 close, 4 AUFZ, 5 UMW, 6 TRAIN, 7 LOESCH
+      }
+    }
+    // inside the window body (not a button): consume so the scene does not
+    // orbit under the finger
+    if (x >= wr[0] && x <= wr[2] && y >= wr[1] && y <= wr[3]) return 8;
+  }
+  return 0;
+}
+
+static void gles_render_windows() {
+  const bool open_nn = gles_window_open(WIN_NN);
+  const bool open_mot = gles_window_open(WIN_MOT);
+  if ((!open_nn && !open_mot) || g_hud_prog == 0) return;
+  const int W = g_win_w, H = g_win_h;
+  const float s2 = std::max(3.f, H / 140.f);
+  const float lh = 6.5f * s2;
+
+  // live state snapshot (loop thread publishes under g_ui_mtx)
+  PcsNnState nn;
+  PcsMotState mot;
+  {
+    std::lock_guard<std::mutex> lk(g_ui_mtx);
+    nn = g_nn;
+    mot = g_mot;
+  }
+
+  glUseProgram(g_hud_prog);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+  // ---- batch A: panels ----
+  std::vector<float> v;
+  float wr_nn[4] = {0}, wr_mot[4] = {0};
+  if (open_nn) { ui_window_rect(WIN_NN, wr_nn); push_rect(v, wr_nn, W, H); }
+  if (open_mot) { ui_window_rect(WIN_MOT, wr_mot); push_rect(v, wr_mot, W, H); }
+  glUniform4f(g_huColor, 0.08f, 0.09f, 0.11f, 0.86f);
+  stream_draw_2f(g_hud_vbo, g_huPos, v);
+
+  // ---- batch B: in-window buttons (slate) + close buttons (red) ----
+  v.clear();
+  for (int w = 0; w < WIN_COUNT; ++w) {
+    if (!(w == WIN_NN ? open_nn : open_mot)) continue;
+    const int n = (w == WIN_NN) ? 2 : 5;
+    for (int b = 0; b < n; ++b) {
+      float r[4];
+      if (!ui_window_button_rect(w, b, r)) continue;
+      if (!((w == WIN_NN && b == 0) || (w == WIN_MOT && b == 0)))
+        push_rect(v, r, W, H);
+    }
+  }
+  glUniform4f(g_huColor, 0.22f, 0.24f, 0.29f, 0.96f);
+  stream_draw_2f(g_hud_vbo, g_huPos, v);
+  v.clear();
+  for (int w = 0; w < WIN_COUNT; ++w) {
+    if (!(w == WIN_NN ? open_nn : open_mot)) continue;
+    float r[4];
+    if (ui_window_button_rect(w, 0, r)) push_rect(v, r, W, H);
+  }
+  glUniform4f(g_huColor, 0.62f, 0.18f, 0.14f, 0.96f);
+  stream_draw_2f(g_hud_vbo, g_huPos, v);
+
+  // ---- batch C: text ----
+  v.clear();
+  static const char* kNnStatic[] = {
+      "EVENT-KAMERA 96X72 - 576 BINS",
+      "ALIF-LSNN: 128 NEURONE ADAPTIV",
+      "FEP-CODER: 32D EMBEDDING",
+      "SOFT-MOE: 8 PROTOTYPEN",
+      "KAN-MLP 24-8-8 + LORA R4 LYAP",
+      "",
+  };
+  if (open_nn) {
+    text_quads(v, "NEURONALES NETZ - 100 HZ", wr_nn[0] + 0.010f * W,
+               wr_nn[1] + 0.012f * H, s2, W, H);
+    float ty = wr_nn[1] + 0.012f * H + 2 * lh;
+    for (const char* l : kNnStatic) {
+      text_quads(v, l, wr_nn[0] + 0.010f * W, ty, s2, W, H);
+      ty += lh;
+    }
+    char ln[48];
+    snprintf(ln, sizeof ln, "EVENTS %u  SPIKES %u", nn.events, nn.spikes);
+    text_quads(v, ln, wr_nn[0] + 0.010f * W, ty, s2, W, H);
+    ty += lh;
+    snprintf(ln, sizeof ln, "EMB %.3f  FEP-E %.4f", nn.emb_norm,
+             nn.free_energy);
+    text_quads(v, ln, wr_nn[0] + 0.010f * W, ty, s2, W, H);
+    ty += lh;
+    snprintf(ln, sizeof ln, "LORA ETA %.3f  V %.4f", nn.lora_eta, nn.lora_v);
+    text_quads(v, ln, wr_nn[0] + 0.010f * W, ty, s2, W, H);
+    ty += lh;
+    snprintf(ln, sizeof ln, "MOE-MAX %.2f  PHASE %s", nn.moe_max,
+             kPhaseName[nn.phase & 7]);
+    text_quads(v, ln, wr_nn[0] + 0.010f * W, ty, s2, W, H);
+    ty += lh;
+    snprintf(ln, sizeof ln, "T US: P%u E%u S%u M%u", nn.t_phys, nn.t_event,
+             nn.t_snn, nn.t_mlp);
+    text_quads(v, ln, wr_nn[0] + 0.010f * W, ty, s2, W, H);
+  }
+  if (open_mot) {
+    text_quads(v, "MOTION-MANAGER", wr_mot[0] + 0.010f * W,
+               wr_mot[1] + 0.012f * H, s2, W, H);
+    float ty = wr_mot[1] + 0.012f * H + 2 * lh;
+    char ln[48];
+    text_quads(v, mot.msg[0] ? mot.msg : "BEREIT", wr_mot[0] + 0.010f * W, ty,
+               s2, W, H);
+    ty += lh;
+    snprintf(ln, sizeof ln, "CLIPS %d  SAMPLES %d", mot.clips, mot.samples);
+    text_quads(v, ln, wr_mot[0] + 0.010f * W, ty, s2, W, H);
+    ty += lh;
+    snprintf(ln, sizeof ln, "MERKMAL 32D  N %.2f", mot.last_feat_norm);
+    text_quads(v, ln, wr_mot[0] + 0.010f * W, ty, s2, W, H);
+    ty += lh;
+    snprintf(ln, sizeof ln, "LORA-UPDATES %d", mot.updates);
+    text_quads(v, ln, wr_mot[0] + 0.010f * W, ty, s2, W, H);
+    ty += lh;
+    text_quads(v, "", wr_mot[0] + 0.010f * W, ty, s2, W, H);
+    ty += lh;
+    text_quads(v, "AUFZ: LETZTE 2.5 S AUFNEHMEN", wr_mot[0] + 0.010f * W, ty,
+               s2, W, H);
+    ty += lh;
+    text_quads(v, "UMW: IN 32D-DATENSATZ UMWANDELN", wr_mot[0] + 0.010f * W,
+               ty, s2, W, H);
+    ty += lh;
+    text_quads(v, "TRAIN: LORA-LYAPUNOV UPDATES", wr_mot[0] + 0.010f * W, ty,
+               s2, W, H);
+  }
+  glUniform4f(g_huColor, 1.f, 1.f, 1.f, 1.f);
+  stream_draw_2f(g_hud_vbo, g_huPos, v);
+
+  // ---- batch D: button labels ----
+  v.clear();
+  static const char* kNnBtn[2] = {"X", "KAM"};
+  static const char* kMotBtn[5] = {"X", "AUFZ", "UMW", "TRAIN", "LOESCH"};
+  for (int w = 0; w < WIN_COUNT; ++w) {
+    if (!(w == WIN_NN ? open_nn : open_mot)) continue;
+    const int n = (w == WIN_NN) ? 2 : 5;
+    for (int b = 0; b < n; ++b) {
+      float r[4];
+      if (!ui_window_button_rect(w, b, r)) continue;
+      const char* lbl = (w == WIN_NN) ? kNnBtn[b] : kMotBtn[b];
+      const float tw = text_width(lbl, s2);
+      text_quads(v, lbl, (r[0] + r[2]) * 0.5f - tw * 0.5f,
+                 (r[1] + r[3]) * 0.5f - 2.5f * s2, s2, W, H);
+    }
+  }
+  glUniform4f(g_huColor, 1.f, 1.f, 1.f, 1.f);
+  stream_draw_2f(g_hud_vbo, g_huPos, v);
+
+  glDisable(GL_BLEND);
 }
 
 // ---------------- picture-in-picture robot camera ----------------
@@ -733,31 +1027,48 @@ static void gles_draw_pip() {
   const float y0 = 0.06f * H, y1 = y0 + ph;
   if (g_pip_tex == 0 || g_pip_w != kEvW || g_pip_h != kEvH) return;
 
+  // v1.3.0 FLICKER FIX (field report: "Kamera-Bild wird kurz Vollbild").
+  // The old path drew an NDC quad sized from window pixels — any transient
+  // state inconsistency (resize window racing a frame, driver-side buffer
+  // churn) turned the quad into a fullscreen camera flash. The image can now
+  // PHYSICALLY not leave its rectangle: it is drawn as a fullscreen quad
+  // THROUGH a viewport+scissor locked to the PiP rect. Nothing outside the
+  // rect is ever touched, whatever happens to the vertex data.
+  const int ix0 = std::max(0, (int)x0), iy0 = std::max(0, (int)y0);
+  const int ix1 = std::min(W, (int)(x0 + pw + 3.f) + 3);
+  const int iy1 = std::min(H, (int)(y0 + ph + 3.f) + 3);
+  const int iw = ix1 - ix0, ih = iy1 - iy0;
+  if (iw < 8 || ih < 8 || W < 64 || H < 64) return;  // degenerate guard
+
   glBindTexture(GL_TEXTURE_2D, g_pip_tex);
   glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, g_pip_w, g_pip_h, GL_RGB,
                   GL_UNSIGNED_BYTE, frame.data());
 
-  const float xa = 2.f * x0 / W - 1.f, xb = 2.f * x1 / W - 1.f;
-  const float ya = 1.f - 2.f * y0 / H, yb = 1.f - 2.f * y1 / H;
-  // uv: row 0 of the buffer is the image TOP -> v=0 at the quad top
-  const float q[4][4] = {{xa, ya, 0.f, 0.f}, {xb, ya, 1.f, 0.f},
-                         {xb, yb, 1.f, 1.f}, {xa, yb, 0.f, 1.f}};
-  const int idx[6] = {0, 1, 2, 0, 2, 3};
-  std::vector<float> v;
-  for (int i : idx) v.insert(v.end(), q[i], q[i] + 4);
-
-  // white 2-px border behind the camera image (makes the PiP readable
-  // against the grey table)
+  // white 2-px border behind the camera image: drawn with the HUD program
+  // under a scissor locked to the border rect (also cannot leak)
   {
-    const float bx0 = 2.f * (x0 - 3.f) / W - 1.f, bx1 = 2.f * (x1 + 3.f) / W - 1.f;
-    const float bya = 1.f - 2.f * (y0 - 3.f) / H, byb = 1.f - 2.f * (y1 + 3.f) / H;
-    std::vector<float> bv;
-    bv.insert(bv.end(), {bx0, bya, bx1, bya, bx1, byb});
-    bv.insert(bv.end(), {bx0, bya, bx1, byb, bx0, byb});
+    glViewport(ix0, iy0, iw, ih);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(ix0, iy0, iw, ih);
     glUseProgram(g_hud_prog);
     glUniform4f(g_huColor, 1.f, 1.f, 1.f, 1.f);
-    stream_draw_2f(g_hud_vbo, g_huPos, bv);
+    // fullscreen quad in this viewport == the border rect
+    static const float bquad[12] = {-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1};
+    stream_draw_2f(g_hud_vbo, g_huPos,
+                   std::vector<float>(bquad, bquad + 12));
   }
+
+  // camera image: fullscreen quad through a viewport+scissor = exactly the
+  // PiP rectangle (border 3 px shows around it)
+  glViewport(ix0 + 3, iy0 + 3, std::max(2, iw - 6), std::max(2, ih - 6));
+  glScissor(ix0 + 3, iy0 + 3, std::max(2, iw - 6), std::max(2, ih - 6));
+  // uv: row 0 of the buffer is the image TOP -> v=0 at the quad top
+  static const float q[6][4] = {{-1.f, 1.f, 0.f, 0.f}, {1.f, 1.f, 1.f, 0.f},
+                                {1.f, -1.f, 1.f, 1.f}, {-1.f, 1.f, 0.f, 0.f},
+                                {1.f, -1.f, 1.f, 1.f}, {-1.f, -1.f, 0.f, 1.f}};
+  std::vector<float> v;
+  for (const auto& c : q) v.insert(v.end(), c, c + 4);
+
   glUseProgram(g_pip_prog);
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, g_pip_tex);
@@ -774,21 +1085,35 @@ static void gles_draw_pip() {
   glDisableVertexAttribArray((GLuint)g_pip_aPos);
   glDisableVertexAttribArray((GLuint)g_pip_aUV);
   glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+  // restore full-screen state — the HUD after this frame depends on it
+  glViewport(0, 0, W, H);
+  glDisable(GL_SCISSOR_TEST);
   glBindTexture(GL_TEXTURE_2D, 0);
 }
 
 // ---------------- touch buttons + UI state ----------------
 
-int gles_hit_button(float x, float y) {
+// ONE layout for the bottom button bar — shared by the HUD draw and the
+// touch hit-test (v1.1.0 had two copies that could drift apart)
+void ui_button_rect(int i, float r[4]) {
   const int W = g_win_w, H = g_win_h;
-  const float m = 0.018f * W;
-  const float gap = 0.014f * W;
-  const float bw = (W - 2 * m - 3 * gap) / 4.f;
-  const float bh = 0.115f * H;
-  const float y0 = H - bh - 0.018f * H;
+  const float m = 0.014f * W;
+  const float gap = 0.010f * W;
+  const float bw = (W - 2 * m - (BTN_COUNT - 1) * gap) / (float)BTN_COUNT;
+  const float bh = 0.105f * H;
+  // pixel coords with TOP-left origin (matches Android touch coords)
+  r[0] = m + i * (bw + gap);
+  r[1] = H - bh - 0.018f * H;
+  r[2] = r[0] + bw;
+  r[3] = r[1] + bh;
+}
+
+int gles_hit_button(float x, float y) {
   for (int i = 0; i < BTN_COUNT; ++i) {
-    const float x0 = m + i * (bw + gap);
-    if (x >= x0 && x <= x0 + bw && y >= y0 && y <= y0 + bh) return i;
+    float r[4];
+    ui_button_rect(i, r);
+    if (x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3]) return i;
   }
   return -1;
 }

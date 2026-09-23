@@ -49,6 +49,11 @@ class SimGlue {
   void cam_event_pose(float pos[3], float fwd[3], float up[3], float right[3],
                       float* fovy_deg) const;
 
+  // v1.3.0 motion manager: stable read of the current arm state (actual
+  // joint positions, gripper slide, tcp position) — used by the 100 Hz loop
+  // to record motion clips without racing mjData
+  void arm_state(float q[7], float* grip, float tcp[3]) const;
+
  private:
   void resolve_ids();
   void refresh_eval();
