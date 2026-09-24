@@ -4,6 +4,9 @@
 //           reports success rate + per-stage timings
 //   bench : warmup (1000 cycles) + timing benchmark (mj_step budget check)
 //   stress: 50-cube scene physics benchmark
+//   train : v1.6.0 RL training (episodic PPO-lite on the 14 skill params,
+//           fast mode = no perception stages). Prints the learning curve;
+//           the resulting policy file is the same format the APK uses.
 //
 // The projector renders a tiny 96x72 RGB view from the fixed overhead event
 // camera on the CPU (colored rectangles) — same downstream pipeline as the
@@ -130,6 +133,7 @@ struct Stat { std::vector<uint32_t> v;
 
 int main(int argc, char** argv) {
   std::string mode = "eval", scene = "scene/scene_8.mjb", weights = "weights/weights.bin";
+  std::string policy = "rl_policy.bin";
   int episodes = 10;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -138,6 +142,7 @@ int main(int argc, char** argv) {
     else if (a == "--scene") scene = next(scene.c_str());
     else if (a == "--weights") weights = next(weights.c_str());
     else if (a == "--episodes") episodes = atoi(next("10"));
+    else if (a == "--policy") policy = next(policy.c_str());
   }
 
   SimGlue glue;
@@ -153,6 +158,14 @@ int main(int argc, char** argv) {
   CpuProjector proj;
   proj.init(glue);
   bool grasp_logged_ = false;
+
+  // v1.6.0: the RL policy (loaded if a file exists — CONTINUES training)
+  RlPolicy rl;
+  rl.reset();
+  if (rl.load(policy.c_str()))
+    printf("policy loaded: %d episodes, best reward %.3f\n",
+           rl.stats().episodes, rl.stats().reward_best);
+  rl.apply_mean(&glue.skill());
 
   ControllerOutput out;
   static uint8_t frame[kEvW * kEvH * 3];
@@ -207,8 +220,9 @@ int main(int argc, char** argv) {
       const int srt = glue.sorted_count();
       const int stk = glue.stacked_count();
       total_sorted += srt; total_stacked += stk; total_cubes += glue.total_cubes();
-      printf("episode %2d: cycles=%5d sorted=%d/%d stacked=%d  [phases end: %s]\n",
-             ep, cyc, srt, glue.total_cubes(), stk, kPhaseName[out.task.phase]);
+      printf("episode %2d: cycles=%5d sorted=%d/%d stacked=%d grasps=%d fails=%d  [phases end: %s]\n",
+             ep, cyc, srt, glue.total_cubes(), stk, glue.ep_grasps(),
+             glue.ep_fails(), kPhaseName[out.task.phase]);
     }
     printf("\n=== RESULT: sorted %d/%d = %.1f%% (stacked %d) ===\n",
            total_sorted, total_cubes, 100.0 * total_sorted / (total_cubes ? total_cubes : 1),
@@ -217,6 +231,61 @@ int main(int argc, char** argv) {
            phys.pct(0.5), phys.pct(0.95), pipe.pct(0.5), pipe.pct(0.95),
            mlpt.pct(0.5), lora.pct(0.5));
     printf("events/frame p50=%u spikes/cycle p50=%u\n", ev.pct(0.5), snn.pct(0.5));
+  } else if (mode == "train") {
+    // ---------------- v1.6.0 RL training (episodic PPO-lite) ----------------
+    // One episode = reset -> run (fast mode, no perception stages) until
+    // episode_done or the cycle cap -> reward -> policy update.
+    SkillParams theta;
+    const bool nosample = getenv("PCS_NOSAMPLE") != nullptr;
+    const bool nofast = getenv("PCS_NOFAST") != nullptr;
+    const int max_ep_cycles = 30000;   // 300 s sim cap (matches eval)
+    uint64_t seed_base = 1000;   // same layout family as eval
+    float r_ema = 0.f;
+    for (int ep = 0; ep < episodes; ++ep) {
+      if (nosample) rl.apply_mean(&theta); else rl.sample(seed_base + (uint64_t)ep * 104729, &theta);
+      glue.skill() = theta;
+      glue.reset_episode(seed_base + (uint64_t)ep * 7919);
+      ctrl.reset();
+      int cyc = 0;
+      while (cyc < max_ep_cycles) {
+        bool pulse = (cyc % 50) == 0;
+        if (nofast) proj.render(glue, pulse, frame);
+        glue.step_cycle(ctrl, out, nofast ? frame : nullptr, kEvW, kEvH, nofast ? pulse : false, !nofast);
+        if (out.task.episode_done) break;
+        ++cyc;
+      }
+      const int total = glue.total_cubes();
+      const int sorted = glue.sorted_count();
+      const int stacked = glue.stacked_count();
+      const int grasps = glue.ep_grasps();
+      const int fails = glue.ep_fails();
+      const int attempts = grasps + fails;
+      const float r =
+          2.0f * (total ? (float)sorted / total : 0.f)
+        + 0.5f * (total ? (float)stacked / total : 0.f)
+        + 0.5f * (attempts ? (float)grasps / attempts : 0.f)
+        - 0.4f * (attempts ? (float)fails / attempts : 0.f)
+        - 0.6f * std::min(1.f, (float)cyc / (float)max_ep_cycles);
+      const bool success = total > 0 && sorted == total;
+      rl.observe(r, success);
+      r_ema += 0.1f * (r - r_ema);
+      if ((ep + 1) % 10 == 0 || ep == episodes - 1) {
+        rl.apply_mean(&glue.skill());
+        printf("ep %4d | cyc %5d | sorted %d/%d | grasps %2d fails %d | r %.2f "
+               "(ema %.2f, best %.2f) | success %5.1f%% (recent %5.1f%%)\n",
+               ep + 1, cyc, sorted, total, grasps, fails, r, r_ema,
+               rl.stats().reward_best,
+               100.f * rl.stats().successes / (float)rl.stats().episodes,
+               100.f * rl.stats().rate_recent);
+        fflush(stdout);
+      }
+    }
+    rl.apply_mean(&glue.skill());
+    if (rl.save(policy.c_str()))
+      printf("policy saved to %s (episodes %d, success %.1f%%, best r %.3f)\n",
+             policy.c_str(), rl.stats().episodes,
+             100.f * rl.stats().successes / (float)rl.stats().episodes,
+             rl.stats().reward_best);
   } else if (mode == "bench") {
     // warmup: 1000 cycles (cache fill, DVFS stabilization)
     glue.reset_episode(42);

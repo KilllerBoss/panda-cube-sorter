@@ -6,16 +6,26 @@
 
 namespace pcs {
 
-// tcp sits at the fingertip plane of the REAL Panda hand (0.126 below the
-// hand origin; pads at 0.103): grasp = pads beside cube mid-height =>
-// tcp = 0.275 - 0.023 = 0.252; carried cubes ride ~0.023 above tcp.
-static constexpr float kGraspZ   = 0.252f;   // pads beside cube mid-height
-static constexpr float kAlignZ   = 0.282f;   // v1.5.0 stage-1 stop: pads 28 mm
-                                             // above cube mid-height (funnel)
-static constexpr float kPlaceZ0  = 0.252f;   // cube bottom touches table/stack
-static constexpr float kTransZ   = 0.42f;
+// tcp sits at the fingertip plane of the REAL Panda hand. v1.6.0: the
+// approach axis task now points the hand's LOCAL +X down (the fork axis),
+// so the pads span [tcp-0.010, tcp+0.074] vertically and carried cubes ride
+// ~5 mm above the tcp. Heights are RL-tunable via SkillParams.
+static constexpr float kCubeMid = 0.275f;    // cube mid-height on the table
+static constexpr float kTransZ  = 0.42f;
 static constexpr float kStackDz  = 0.052f;   // cube height + clearance
 static constexpr float kSlotScoreMin = -10.f;  // relative selection only
+
+// grasp-plane tcp height + stage-1 stop height from the skill parameters
+// v1.6.0: with the corrected hand-x-down approach the pads span
+// [tcp-0.010, tcp+0.074]; default grasp tcp = 0.270 (mid 0.275 - 0.005)
+inline float grasp_z_of(const SkillParams* P) {
+  const float off = P ? P->grasp_z_off : 0.005f;
+  return kCubeMid - off;
+}
+inline float align_z_of(const SkillParams* P) {
+  const float a = P ? P->align_z : 0.030f;
+  return grasp_z_of(P) + a;
+}
 
 void TaskLayer::reset() {
   next_color_ = 0; in_flight_ = false; flight_slot_ = -1; phase_t_ = 0.f;
@@ -25,14 +35,15 @@ void TaskLayer::reset() {
   phase_ = PH_RESET;
 }
 
-static float phase_duration(int p) {
+// phase durations: v1.6.0 DESCEND/GRASP/LIFT are RL-tunable
+static float phase_duration(int p, const SkillParams* P) {
   switch (p) {
     case PH_RESET: return 0.3f;
     case PH_HOME: return 1.1f;
-    case PH_HOVER: return 0.7f;
-    case PH_DESCEND: return 2.4f;   // v1.5.0: langsam + kritisch gedaempft
-    case PH_GRASP: return 0.9f;     // v1.5.0: Zeit fuer den Kraftaufbau
-    case PH_LIFT: return 1.3f;      // v1.5.0: langsamer = rueckelt nicht raus
+    case PH_HOVER: return 1.8f;   // gated on REACHED (transit to the cube)
+    case PH_DESCEND: return P ? P->descend_t : 3.0f;
+    case PH_GRASP: return P ? P->grasp_t : 0.9f;
+    case PH_LIFT: return P ? P->lift_t : 1.3f;
     case PH_TRANSPORT: return 1.3f;
     case PH_PLACE: return 1.2f;
   }
@@ -49,7 +60,7 @@ void TaskLayer::start_phase(int p, const TaskInput& in, TaskOutput& out) {
   prev_phase_ = phase_;
   phase_ = p;
   phase_t_ = 0.f;
-  phase_dur_ = phase_duration(p);
+  phase_dur_ = phase_duration(p, in.skill);
   for (int j = 0; j < kDof; ++j) { out.q_start[j] = in.q[j]; q_start_[j] = in.q[j]; }
   out.ik_needed = true;
 }
@@ -79,6 +90,8 @@ inline float dist2xy(const float* a, const float* b) {
 }  // namespace
 
 void TaskLayer::update(const TaskInput& in, TaskOutput& out) {
+  // v1.6.0: the active skill parameter set (RL mean or sampled theta)
+  const SkillParams* P = in.skill;
   out.phase = phase_;
   out.ik_needed = false;
   out.episode_done = done_;
@@ -149,7 +162,15 @@ void TaskLayer::update(const TaskInput& in, TaskOutput& out) {
       }
       out.tcp_target[2] = kTransZ;
       out.grip_target = kGripOpen;
-      if (out.s >= 1.f) {
+      // v1.6.0: leave HOVER only when the hover point is actually REACHED
+      // (near the cube xy at transit height). The old pure-time exit fired
+      // while the arm was still at home; DESCEND then swept the elbow
+      // diagonally through the cube field (link3 plowed into cubes/table and
+      // the shoulder locked). Timeout fallback stays for unreachable slots.
+      const bool hover_ok = cur_slot_ >= 0 && cur_slot_ < in.n_cubes
+          && dist2xy(in.tcp_actual, out.tcp_target) < 0.03f
+          && in.tcp_actual[2] > kTransZ - 0.06f;
+      if (hover_ok || out.s >= 2.f) {
         // v1.5.0: FREEZE the grasp point NOW. Tracking the live cube position
         // during DESCEND/GRASP made the gripper chase (and push) the sliding
         // cube across the table — the classic "schieben statt greifen".
@@ -169,16 +190,42 @@ void TaskLayer::update(const TaskInput& in, TaskOutput& out) {
       // over cube mid-height) while the pads pre-close to just over both the
       // flank (50 mm) and diagonal (71 mm) envelopes — the funnel aligns a
       // rotated cube without pushing it.
+      // v1.6.0: stop heights + gates are RL-tunable
+      const float align_z = align_z_of(P);
+      const float xy_gate = P ? P->xy_gate : 0.008f;
+      const float z_gate = P ? P->z_gate : 0.012f;
       out.s = phase_t_ / phase_dur_;
+      // v1.6.0 COLLISION-FREE PATH: high transit FIRST, then vertical
+      // descent. The old direct approach from home swept the elbow through
+      // the cube field (link3-vs-cube/table contact locked the shoulder).
+      // Stage A: above the cube at transit height. Stage B: straight down.
+      // NOTE: the switch is purely horizontal — a z-based switch would
+      // deadlock (the stage-A target IS the transit height).
+      const float dxy_grab = dist2xy(in.tcp_actual, grab_xy_);
+      const bool high = dxy_grab > 0.06f;
       out.tcp_target[0] = grab_xy_[0] + wiggle_dx_;
       out.tcp_target[1] = grab_xy_[1] + wiggle_dy_;
-      out.tcp_target[2] = kAlignZ;
+      out.tcp_target[2] = high ? kTransZ : align_z;
       out.tcp_yaw = grab_yaw_;
       out.yaw_valid = true;
       float g;
-      if (out.s < 0.30f) g = kGripOpen;
-      else g = kGripOpen + (kGripPre - kGripOpen)
-                        * std::min(1.f, (out.s - 0.30f) / 0.45f);
+      const float grip_pre = P ? P->grip_pre : kGripPre;
+      // v1.6.0 ROOT-CAUSE FIX (0% Erfolg): the old progress-based pre-close
+      // (ramp at s in [0.30, 0.75]) started closing while the pads were
+      // still ABOVE the cube — the gap (63 mm) is narrower than the cube
+      // diagonal (70.7 mm), so the pads WEDGED on the top corners and the
+      // arm stalled ~47 mm above the target ("pads ride the cube top").
+      // Now the pads stay OPEN until the tcp is beside the cube (below the
+      // cube top, tcp_z < cube_mid + 12 mm) and only then funnel close.
+      // The funnel still aligns a rotated cube — but from the flank, not
+      // from the top.
+      const float pre_z = kCubeMid + 0.012f;
+      if (in.tcp_actual[2] > pre_z) {
+        g = kGripOpen;
+      } else {
+        const float t = clampf((pre_z - in.tcp_actual[2]) / 0.02f, 0.f, 1.f);
+        g = kGripOpen + (grip_pre - kGripOpen) * t;
+      }
       out.grip_target = g;
       // v1.5.0: stage-1 exit requires the XY error to be TIGHT (8 mm) — the
       // old combined 3D 25 mm gate let the gripper descend with a lateral
@@ -187,25 +234,36 @@ void TaskLayer::update(const TaskInput& in, TaskOutput& out) {
                             in.tcp_actual[2]};
       const float txy[3] = {out.tcp_target[0], out.tcp_target[1],
                             out.tcp_target[2]};
-      const bool xy_ok = dist2xy(in.tcp_actual, pxy) < 0.008f;
-      const bool z_ok = dist3(in.tcp_actual, txy) < 0.012f;
+      const bool xy_ok = !high && dist2xy(in.tcp_actual, pxy) < xy_gate;
+      const bool z_ok = !high && dist3(in.tcp_actual, txy) < z_gate;
       // one-sided touch while descending: klemme sofort, statt zu schieben
-      if (in.contact_l != in.contact_r && out.s > 0.3f) {
+      if (!high && in.contact_l != in.contact_r && out.s > 0.3f) {
         start_phase(PH_GRASP, in, out);
         break;
       }
-      if ((out.s >= 1.f && xy_ok && z_ok) || phase_t_ >= 8.f)
+      if ((out.s >= 1.f && xy_ok && z_ok) || phase_t_ >= 10.f)
         start_phase(PH_GRASP, in, out);
       break;
     }
 
     case PH_GRASP: {
-      // stage 2: descend the last 23 mm WHILE closing pre -> closed; the
+      // stage 2: descend the last ~23 mm WHILE closing pre -> closed; the
       // cube is gripped around its flanks instead of pushed sideways
+      // v1.6.0: grasp depth + wiggle amplitude are RL-tunable
+      const float grasp_z = grasp_z_of(P);
+      const float wig = P ? P->wiggle_amp : 0.012f;
       out.s = phase_t_ / phase_dur_;
       out.tcp_target[0] = grab_xy_[0] + wiggle_dx_;
       out.tcp_target[1] = grab_xy_[1] + wiggle_dy_;
-      out.tcp_target[2] = kGraspZ;
+      // v1.6.0: HOLD the height when exactly ONE pad already touches the
+      // cube. The old rule kept descending while a plate edge was hooked on
+      // the cube's top corner — the fork then plowed the cube across (and
+      // off) the table ("Wuerfel wird uebern Tisch geschossen"). Holding and
+      // closing lets the funnel realign the cube and complete the grip.
+      if (in.contact_l != in.contact_r)
+        out.tcp_target[2] = std::max(in.tcp_actual[2], grasp_z);
+      else
+        out.tcp_target[2] = grasp_z;
       out.tcp_yaw = grab_yaw_;
       out.yaw_valid = true;
       float g;
@@ -218,8 +276,12 @@ void TaskLayer::update(const TaskInput& in, TaskOutput& out) {
       // (deep) AND the close ramp has finished (clamped). The old rule fired
       // on the first touch — pads grazed the cube TOP and the lift tore the
       // immature grip open (cube dropped at lift start).
-      const bool deep = in.tcp_actual[2] < kGraspZ + 0.012f;
-      const bool clamped = g <= kGripClosed + 0.004f && phase_t_ >= 0.55f;
+      const bool deep = in.tcp_actual[2] < grasp_z + 0.012f;
+      // v1.6.0: relative clamp time (the old hard 0.55 s broke whenever RL
+      // sampled a shorter grasp_t — the phase could NEVER exit and every
+      // training episode failed identically, destroying the gradient)
+      const bool clamped = g <= kGripClosed + 0.004f
+                           && phase_t_ >= 0.61f * phase_dur_;
       if (in.grasped && deep && clamped) {
         wiggle_tries_ = 0; wiggle_dx_ = wiggle_dy_ = 0.f;
         in_flight_ = true; flight_slot_ = cur_slot_;
@@ -229,8 +291,8 @@ void TaskLayer::update(const TaskInput& in, TaskOutput& out) {
           // grasp-wiggle: re-read the (possibly pushed) cube, shift approach
           wiggle_tries_++;
           const float a = 3.1f * (float)wiggle_tries_;
-          wiggle_dx_ = 0.012f * cosf(a);
-          wiggle_dy_ = 0.012f * sinf(a);
+          wiggle_dx_ = wig * cosf(a);
+          wiggle_dy_ = wig * sinf(a);
           slot_tries_[cur_slot_ >= 0 ? cur_slot_ : 0]++;
           if (cur_slot_ >= 0 && cur_slot_ < in.n_cubes) {
             grab_xy_[0] = in.cubes[cur_slot_].x;
@@ -289,12 +351,14 @@ void TaskLayer::update(const TaskInput& in, TaskOutput& out) {
     case PH_PLACE: {
       out.s = phase_t_ / phase_dur_;
       const int col = clampf((float)next_color_, 0.f, (float)(kNumColors - 1));
+      const float place_z0 = grasp_z_of(P);   // cube bottom touches table/stack
       out.tcp_target[0] = zones[col][0];
       out.tcp_target[1] = zones[col][1];
-      out.tcp_target[2] = kPlaceZ0 + zone_stack[col] * kStackDz;
+      out.tcp_target[2] = place_z0 + zone_stack[col] * kStackDz;
       out.tcp_yaw = grab_yaw_;
       out.yaw_valid = true;
-      out.grip_target = out.s > 0.6f ? kGripOpen : kGripClosed;
+      out.grip_target = out.s > (P ? P->release_s : 0.60f) ? kGripOpen
+                                                           : kGripClosed;
       if ((out.s >= 1.f && dist3(in.tcp_actual, out.tcp_target) < 0.02f) || phase_t_ >= 5.f) {
         if (in_flight_) {
           zone_stack[col]++;

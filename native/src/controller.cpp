@@ -34,16 +34,26 @@ void Controller::cycle(const ControllerInput& in, ControllerOutput& out) {
   auto t0 = clk::now();
 
   // ---------- Phase 2: perception ----------
-  cam.process(in.frame_rgb, in.frame_w, in.frame_h, in.refresh_pulse, out.events);
-  if (in.refresh_pulse) {
-    memcpy(pulse_bins_, out.events.bins, sizeof(pulse_bins_));  // latch snapshot
+  // v1.6.0 fast mode: the network stages are bypassed entirely. The task
+  // layer below runs on the simulator's true slots, so the RL training
+  // episodes need only physics + task + IK.
+  if (!in.fast) {
+    cam.process(in.frame_rgb, in.frame_w, in.frame_h, in.refresh_pulse, out.events);
+    if (in.refresh_pulse) {
+      memcpy(pulse_bins_, out.events.bins, sizeof(pulse_bins_));  // latch snapshot
+    }
+  } else {
+    memset(&out.events, 0, sizeof(out.events));
+    memset(&out.snn, 0, sizeof(out.snn));
+    memset(out.emb, 0, sizeof(out.emb));
+    out.free_energy = 0.f;
   }
   auto t1 = clk::now();
 
-  snn.step(out.events.bins, w, out.snn);
+  if (!in.fast) snn.step(out.events.bins, w, out.snn);
   auto t2 = clk::now();
 
-  coder.step(out.events.bins, out.snn, w, out.emb, out.free_energy);
+  if (!in.fast) coder.step(out.events.bins, out.snn, w, out.emb, out.free_energy);
   auto t3 = clk::now();
 
   TaskInput tin;   // filled by the detection head below + task inputs here
@@ -157,8 +167,30 @@ void Controller::cycle(const ControllerInput& in, ControllerOutput& out) {
   auto t4 = clk::now();
 
   // ---------- Phase 3: motor synthesis ----------
+  // v1.6.0: the task layer reads the active skill parameters (RL)
+  tin.skill = in.skill;
   task.update(tin, out.task);
   auto t5 = clk::now();
+
+  if (in.fast) {
+    // fast mode: skip MoE/MLP/LoRA/prototypes — the geometric IK baseline
+    // alone drives the arm; the texture adds nothing to the learning signal
+    memset(out.q_add, 0, sizeof(out.q_add));
+    memset(&out.mlp, 0, sizeof(out.mlp));
+    for (int j = 0; j < kDof; ++j) out.q_des[j] = out.task.q_goal[j];
+    out.grip_target = out.task.grip_target;
+    auto usf = [](std::chrono::steady_clock::duration d) {
+      return (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(d).count(); };
+    out.stats.t_event = out.stats.t_snn = out.stats.t_moe = 0;
+    out.stats.t_mlp = out.stats.t_lora = 0;
+    out.stats.t_task = usf(t5 - t4);
+    out.stats.t_total = usf(t5 - t0);
+    out.stats.t_phys = 0;
+    out.stats.n_events = 0;
+    out.stats.n_spikes = 0;
+    out.stats.cycles++;
+    return;
+  }
 
   float bias[kMlpOut];
   softmoe_bias(w, out.emb, bias);

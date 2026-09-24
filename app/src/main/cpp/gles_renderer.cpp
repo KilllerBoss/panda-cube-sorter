@@ -189,7 +189,8 @@ static const float kTextSec[3] = {0.63f, 0.63f, 0.66f};
 
 // 7x7 pixel icons, one byte per row, bit 6 = leftmost column
 enum PcsIcon {
-  IC_PLAY = 0, IC_PAUSE, IC_STOP, IC_BOLT, IC_PLUS, IC_CHIP, IC_BARS, IC_COUNT
+  IC_PLAY = 0, IC_PAUSE, IC_STOP, IC_BOLT, IC_PLUS, IC_CHIP, IC_BARS,
+  IC_TARGET, IC_COUNT
 };
 static const uint8_t kIcons[IC_COUNT][7] = {
     {0x40, 0x60, 0x70, 0x78, 0x70, 0x60, 0x40},  // play   (triangle right)
@@ -198,10 +199,12 @@ static const uint8_t kIcons[IC_COUNT][7] = {
     {0x06, 0x0C, 0x18, 0x3E, 0x0C, 0x18, 0x30},  // bolt   (finetune)
     {0x08, 0x08, 0x08, 0x3E, 0x08, 0x08, 0x08},  // plus   (new episode)
     {0x08, 0x3E, 0x22, 0x2A, 0x22, 0x3E, 0x08},  // chip   (NN)
-    {0x7C, 0x00, 0x3C, 0x00, 0x1C, 0x00, 0x00}}; // bars   (motion clips)
+    {0x7C, 0x00, 0x3C, 0x00, 0x1C, 0x00, 0x00},  // bars   (motion clips)
+    {0x1C, 0x22, 0x41, 0x5D, 0x41, 0x22, 0x1C}}; // target (RL)
 
 static PcsNnState g_nn;
 static PcsMotState g_mot;
+static PcsRlState g_rl;
 // g_nn/g_mot are PODs written by the loop, read by the view — guarded by
 // g_ui_mtx together with the diag state (same contention profile)
 void gles_set_nn(const PcsNnState& s) {
@@ -211,6 +214,10 @@ void gles_set_nn(const PcsNnState& s) {
 void gles_set_motion(const PcsMotState& s) {
   std::lock_guard<std::mutex> lk(g_ui_mtx);
   g_mot = s;
+}
+void gles_set_rl(const PcsRlState& s) {
+  std::lock_guard<std::mutex> lk(g_ui_mtx);
+  g_rl = s;
 }
 
 // view frames that ended with a GL error (HUD "G<n>")
@@ -578,6 +585,35 @@ static void ui_render_window_bars(std::vector<float>& ui, int win,
       if (i == 3) { frac = g_nn.lora_eta / 0.5f; col = TOAST_ORANGE; }
       ui_bar(ui, bx0, cy - bh * 0.5f, bx1 - bx0, bh, frac, col, W, H);
     }
+  } else if (win == WIN_RL) {
+    // v1.6.0: RL window — success-rate bars + theta bars + 3 action buttons
+    // row 5: success bars (GESAMT vs LETZTE 20)
+    const float bx0 = wr[0] + 0.075f * W, bx1 = wr[2] - 0.105f * W;
+    const float bh = 0.85f * s2;
+    for (int i = 0; i < 4; ++i) {
+      const float cy = wr[1] + 0.042f * H + (5 + i) * lh + 1.1f * s2;
+      float frac = 0.f;
+      int col = TOAST_BLUE;
+      if (i == 0) { frac = g_rl.rate_all; col = TOAST_GREEN; }
+      if (i == 1) { frac = g_rl.rate_recent; col = TOAST_TEAL; }
+      if (i == 2) frac = g_rl.theta[3];   // T_ABSEN
+      if (i == 3) frac = g_rl.theta[11];  // KRAFT
+      ui_bar(ui, bx0, cy - bh * 0.5f, bx1 - bx0, bh, frac, col, W, H);
+    }
+    // 3 action buttons (bottom row): TRAINIEREN / BEST / ZURUECKSETZEN
+    static const int kRlCol[3] = {TOAST_ORANGE, TOAST_BLUE, TOAST_GRAY};
+    const bool armed = gles_mot_confirm_armed();
+    for (int b = 1; b <= 3; ++b) {
+      float r[4];
+      if (!ui_window_button_rect(win, b, r)) continue;
+      int col = kRlCol[b - 1];
+      if (b == 1 && g_rl.train_active) col = TOAST_RED;
+      if (b == 3 && armed) col = TOAST_RED;
+      const float br = (pressed_wb == b) ? 1.3f : 1.f;
+      const float* c = kAcc[col];
+      ui_rect(ui, r, std::min(1.f, c[0] * br), std::min(1.f, c[1] * br),
+              std::min(1.f, c[2] * br), 0.95f, 0.009f * W, 0.f, W, H);
+    }
   } else {
     // MOT: status blink dot (row 0)
     bool rec = g_mot.rec_left > 0, train = g_mot.train_left > 0;
@@ -630,7 +666,8 @@ static void ui_render_window_text(int win, const float wr[4], int W, int H,
   const float tx0 = wr[0] + pad + 0.004f * W;  // clear of the accent strip
   // title
   text_quads(t_white, win == WIN_NN ? "NEURONALES NETZ \u2014 100 HZ"
-                                    : "MOTION-MANAGER",
+                                    : win == WIN_RL ? "RL-TRAINING \u2014 PPO-LITE"
+                                                    : "MOTION-MANAGER",
              tx0, wr[1] + 0.012f * H, s, W, H);
   // close X
   {
@@ -672,6 +709,47 @@ static void ui_render_window_text(int win, const float wr[4], int W, int H,
     snprintf(l, sizeof l, "PHYS %u  EV %u  SNN %u  MLP %u \u00b5s", g_nn.t_phys,
              g_nn.t_event, g_nn.t_snn, g_nn.t_mlp);
     text_quads(t_gray, l, tx0, row_y(10), s2, W, H);
+  } else if (win == WIN_RL) {
+    // status row (dot drawn in _bars)
+    const char* st = "BEREIT";
+    int stc = TOAST_BLUE;
+    if (g_rl.train_active) { st = "TRAINIERE\u2026"; stc = TOAST_ORANGE; }
+    text_quads(t_acc[stc], st, tx0 + 1.2f * s2, row_y(0), s2, W, H);
+    char l[48];
+    snprintf(l, sizeof l, "EPISODEN %d", g_rl.episodes);
+    text_quads(t_white, l, tx0, row_y(1), s2, W, H);
+    snprintf(l, sizeof l, "EP %d/%d  R %.2f  BEST %.2f", g_rl.ep_sorted,
+             g_rl.ep_total, g_rl.reward_last, g_rl.reward_best);
+    text_quads(t_white, l, tx0, row_y(2), s2, W, H);
+    snprintf(l, sizeof l, "%s", g_rl.msg[0] ? g_rl.msg : "-");
+    text_quads(t_gray, l, tx0, row_y(4), s2, W, H);
+    // bar rows: label left, value right
+    char b0[24], b1[24], b2[24], b3[24];
+    snprintf(b0, sizeof b0, "%.0f%%", 100.f * g_rl.rate_all);
+    snprintf(b1, sizeof b1, "%.0f%%", 100.f * g_rl.rate_recent);
+    snprintf(b2, sizeof b2, "%.2f", g_rl.theta[3]);
+    snprintf(b3, sizeof b3, "%.2f", g_rl.theta[11]);
+    const char* lbls[4] = {"GESAMT", "LETZTE 20", "ABSENK", "KRAFT"};
+    const char* vals[4] = {b0, b1, b2, b3};
+    for (int i = 0; i < 4; ++i) {
+      const float ry = row_y(5 + i);
+      text_quads(t_gray, lbls[i], tx0, ry, s2, W, H);
+      const float vw2 = text_width(vals[i], s2);
+      text_quads(t_white, vals[i], wr[2] - pad - vw2, ry, s2, W, H);
+    }
+    // button labels
+    static const char* kRlLbl[3] = {"TRAINIEREN", "BESTE WERTE",
+                                    "ZUR\u00dcCKSETZEN"};
+    const bool armed = gles_mot_confirm_armed();
+    for (int b = 1; b <= 3; ++b) {
+      float r[4];
+      if (!ui_window_button_rect(win, b, r)) continue;
+      const char* lbl = (b == 1 && g_rl.train_active) ? "STOPP"
+                        : (b == 3 && armed) ? "SICHER?" : kRlLbl[b - 1];
+      const float tw = text_width(lbl, s2);
+      text_quads(t_white, lbl, (r[0] + r[2]) * 0.5f - tw * 0.5f,
+                 (r[1] + r[3]) * 0.5f - 0.5f * s2, s2, W, H);
+    }
   } else {
     // status row (dot drawn in _bars)
     const char* st = "BEREIT";
@@ -1254,9 +1332,10 @@ void gles_render_hud(const CycleStats& st, const TaskOutput& task) {
 
   // ---- action bar (bottom): iOS pills with icon + label ----
   static const int kBtnCol[BTN_COUNT] = {TOAST_GREEN, TOAST_RED, TOAST_ORANGE,
-                                         TOAST_BLUE, TOAST_VIOLET, TOAST_TEAL};
+                                         TOAST_BLUE, TOAST_VIOLET, TOAST_TEAL,
+                                         TOAST_BLUE};
   static const int kBtnIcon[BTN_COUNT] = {IC_PLAY, IC_STOP, IC_BOLT, IC_PLUS,
-                                          IC_CHIP, IC_BARS};
+                                          IC_CHIP, IC_BARS, IC_TARGET};
   const int pressed = g_pressed_btn.load();
   for (int i = 0; i < BTN_COUNT; ++i) {
     float r[4];
@@ -1274,7 +1353,8 @@ void gles_render_hud(const CycleStats& st, const TaskOutput& task) {
     }
     const bool wopen_btn =
         (i == BTN_NN && gles_window_open(WIN_NN)) ||
-        (i == BTN_MOT && gles_window_open(WIN_MOT));
+        (i == BTN_MOT && gles_window_open(WIN_MOT)) ||
+        (i == BTN_RL && gles_window_open(WIN_RL));
     if (wopen_btn) br *= 1.15f;  // toggle buttons look "in" while open
     const float* c = kAcc[col];
     ui_rect(ui, r, std::min(1.f, c[0] * br), std::min(1.f, c[1] * br),
@@ -1291,16 +1371,19 @@ void gles_render_hud(const CycleStats& st, const TaskOutput& task) {
   // ================= window sheets (slide-in, still pass 1) =================
   const bool open_nn = gles_window_open(WIN_NN);
   const bool open_mot = gles_window_open(WIN_MOT);
+  const bool open_rl = gles_window_open(WIN_RL);
   float wr[4] = {0};
   int wopen = -1;
   if (open_nn) { ui_window_rect(WIN_NN, wr); wopen = WIN_NN; }
   else if (open_mot) { ui_window_rect(WIN_MOT, wr); wopen = WIN_MOT; }
+  else if (open_rl) { ui_window_rect(WIN_RL, wr); wopen = WIN_RL; }
   if (wopen >= 0) {
     const float slide = ui_window_slide(wopen);
     wr[1] += slide; wr[3] += slide;
     ui_rect(ui, wr, kCard[0], kCard[1], kCard[2], kCard[3], rad, 0.f, W, H);
     ui_rect(ui, wr, kHair[0], kHair[1], kHair[2], kHair[3], rad, 1.2f, W, H);
-    const float* ac = kAcc[wopen == WIN_NN ? TOAST_VIOLET : TOAST_TEAL];
+    const float* ac = kAcc[wopen == WIN_NN ? TOAST_VIOLET
+                            : wopen == WIN_RL ? TOAST_BLUE : TOAST_TEAL];
     float strip[4] = {wr[0], wr[1], wr[0] + 0.006f * W, wr[3]};
     ui_rect(ui, strip, ac[0], ac[1], ac[2], 0.95f, 0.f, 0.f, W, H);
     // grabber pill (top center, iOS sheet handle)
@@ -1365,7 +1448,7 @@ void gles_render_hud(const CycleStats& st, const TaskOutput& task) {
 
   // ---- button icons + labels ----
   static const char* kLabels[BTN_COUNT] = {"START", "STOP", "FEIN", "NEU",
-                                           "NETZ", "MOTION"};
+                                           "NETZ", "MOTION", "RL"};
   {
     const float cs = std::max(3.f, H / 210.f);
     for (int i = 0; i < BTN_COUNT; ++i) {
@@ -1501,12 +1584,13 @@ static void ui_window_rect(int which, float r[4]) {
   const int W = g_win_w, H = g_win_h;
   const float s2 = std::max(3.f, H / 150.f);
   const float lh = 6.5f * s2;
-  const int lines = (which == WIN_NN) ? 12 : 7;
+  const int lines = (which == WIN_NN) ? 12 : (which == WIN_RL ? 10 : 7);
   r[0] = 0.014f * W;
   r[1] = 0.170f * H;                       // below the status card
   r[2] = r[0] + 0.46f * W;
   r[3] = r[1] + 0.042f * H + lines * lh
-       + (which == WIN_MOT ? 0.092f * H : 0.034f * H);
+       + (which == WIN_MOT ? 0.092f * H
+                           : (which == WIN_RL ? 0.092f * H : 0.034f * H));
   const float maxb = H - 0.152f * H;       // keep above the action bar
   if (r[3] > maxb) r[3] = maxb;
 }
@@ -1537,7 +1621,7 @@ static bool ui_window_button_rect(int win, int btn, float r[4]) {
     r[3] = r[1] + bs;
     return true;
   }
-  const int n = (win == WIN_NN) ? 1 : 4;   // bottom-row buttons
+  const int n = (win == WIN_NN) ? 1 : (win == WIN_RL ? 3 : 4);  // bottom-row buttons
   const int k = btn - 1;
   if (k < 0 || k >= n) return false;
   const float m = 0.012f * W, gap = 0.008f * W, bh = 0.056f * H;
@@ -1554,12 +1638,13 @@ int gles_hit_window_button(float x, float y) {
     if (!gles_window_open(w)) continue;
     float wr[4];
     ui_window_rect(w, wr);
-    const int n = (w == WIN_NN) ? 2 : 5;
+    const int n = (w == WIN_NN) ? 2 : (w == WIN_RL ? 4 : 5);
     for (int b = 0; b < n; ++b) {
       float r[4];
       if (!ui_window_button_rect(w, b, r)) continue;
       if (x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3]) {
         if (w == WIN_NN) return b == 0 ? 1 : 2;   // 1 close, 2 cam reset
+        if (w == WIN_RL) return 20 + b;           // 20 close, 21 TRAIN, 22 BEST, 23 RESET
         return 3 + b;  // 3 close, 4 AUFZ, 5 UMW, 6 TRAIN, 7 LOESCH
       }
     }

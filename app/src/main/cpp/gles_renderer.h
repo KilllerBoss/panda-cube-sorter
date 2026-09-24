@@ -51,12 +51,13 @@ enum PcsButton {
   BTN_NEW,         // new episode: re-randomize 4-8 cubes
   BTN_NN,          // v1.3.0: toggle the neural-net info window
   BTN_MOT,         // v1.3.0: toggle the motion-manager window
+  BTN_RL,          // v1.6.0: toggle the RL-training window
   BTN_COUNT
 };
 
 // ---------------- v1.3.0 windows (NN info + motion manager) ----------------
 
-enum PcsWindow { WIN_NN = 0, WIN_MOT, WIN_COUNT };
+enum PcsWindow { WIN_NN = 0, WIN_MOT, WIN_RL, WIN_COUNT };
 
 // toggle a window on/off (called directly from the input thread)
 void gles_toggle_window(int which);
@@ -67,6 +68,7 @@ bool gles_window_open(int which);
 //   1 NN close   2 NN camera-reset
 //   3 MOT close  4 MOT record (AUFZ)  5 MOT convert (UMW)
 //   6 MOT train  7 MOT clear (LOESCH)
+//  20 RL close  21 RL train start/stop  22 RL best  23 RL reset
 int gles_hit_window_button(float x, float y);
 
 // ---------------- v1.3.0 touch camera (orbit / zoom / pan) ----------------
@@ -92,6 +94,10 @@ struct PcsUiState {
   bool mot_convert = false; // UMW: motion clips -> 32-d features + dataset file
   bool mot_train = false;   // TRAIN: LoRA-Lyapunov updates on the dataset
   bool mot_clear = false;   // LOESCH: drop all clips + dataset
+  // v1.6.0 RL-window actions
+  bool rl_train_toggle = false;  // TRAINIEREN / STOPP
+  bool rl_best = false;          // BESTE WERTE: apply best-ever parameters
+  bool rl_reset = false;         // policy back to v1.6.0 defaults
 };
 PcsUiState gles_take_ui();
 // input thread -> UI flags (OR-accumulated until the loop consumes them)
@@ -134,6 +140,23 @@ struct PcsMotState {
   char  msg[32] = {0};         // short status text for the MOT window
 };
 void gles_set_motion(const PcsMotState& s);
+
+// ---------------- v1.6.0 RL training state (loop -> RL window) -------------
+
+struct PcsRlState {
+  bool  train_active = false;  // training episodes running
+  int   episodes = 0;          // completed training episodes (all time)
+  float rate_all = 0.f;        // success rate over all episodes (0..1)
+  float rate_recent = 0.f;     // success rate, last 20 episodes
+  float reward_last = 0.f;
+  float reward_best = 0.f;
+  int   ep_sorted = 0;         // current episode progress
+  int   ep_total = 0;
+  float theta[14] = {0};       // mu, normalized 0..1 per parameter
+  float sigma_mean = 0.f;      // mean exploration width (0..1)
+  char  msg[32] = {0};
+};
+void gles_set_rl(const PcsRlState& s);
 
 // ---------------- v1.4.0 UI redesign (style, feedback, toasts) ----------------
 

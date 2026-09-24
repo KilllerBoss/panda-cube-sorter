@@ -37,6 +37,12 @@ struct ControllerInput {
   // live in the NN window; only the SLOT SOURCE changes.
   const struct CubeSlot* truth_slots;
   int   truth_n;
+  // v1.6.0 RL fast mode: skip the perception/network stages (event camera,
+  // LSNN, predictive coding, MoE, MLP, LoRA, prototypes). The task layer is
+  // driven purely by the truth slots — exactly what RL training needs, at
+  // ~10x realtime. skill = active skill parameter set (null = defaults).
+  bool  fast = false;
+  const struct SkillParams* skill = nullptr;
 };
 
 struct ControllerOutput {

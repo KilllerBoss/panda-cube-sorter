@@ -61,6 +61,7 @@
 
 #include "glue/sim_glue.h"
 #include "pcs/controller.h"
+#include "pcs/rl_policy.h"
 #include "gles_renderer.h"
 #include "android_asset.h"
 
@@ -96,6 +97,44 @@ static std::mutex g_window_mutex;
 static SimGlue g_glue;
 static Controller g_ctrl;
 static std::vector<uint8_t> g_frame(kEvW * kEvH * 3);
+
+// ---------------- v1.6.0 on-device RL training (PPO-lite) ----------------
+// The RL window's TRAIN button switches the 100 Hz loop into training mode:
+// each 10 ms tick runs 10 FAST sim cycles (no event pass, no network stages
+// — physics + task + IK only, ~10x realtime). One episode = reset -> run
+// until done or cap -> reward -> clipped policy-gradient update. The learned
+// mean (mu) is what the robot uses afterwards; it persists in rl_policy.bin.
+static RlPolicy g_rl;
+static std::atomic<bool> g_rl_train{false};
+static int   g_rl_ep_cycles = 0;
+static uint64_t g_rl_seed_base = 91000;
+static uint64_t g_rl_ep_index = 0;
+static constexpr int kRlCyclesPerTick = 10;   // 100 ms sim per 10 ms tick
+static constexpr int kRlMaxEpCycles = 30000;  // 300 s sim cap per episode
+
+static std::string rl_policy_path() {
+  if (!g_activity || !g_activity->internalDataPath) return std::string();
+  return std::string(g_activity->internalDataPath) + "/rl_policy.bin";
+}
+
+static void rl_publish(const char* msg) {
+  PcsRlState s;
+  s.train_active = g_rl_train.load();
+  s.episodes = g_rl.stats().episodes;
+  s.rate_all = g_rl.stats().episodes
+      ? (float)g_rl.stats().successes / (float)g_rl.stats().episodes : 0.f;
+  s.rate_recent = g_rl.stats().rate_recent;
+  s.reward_last = g_rl.stats().reward_last;
+  s.reward_best = g_rl.stats().reward_best > -1e8f ? g_rl.stats().reward_best : 0.f;
+  s.ep_sorted = g_glue.sorted_count();
+  s.ep_total = g_glue.total_cubes();
+  for (int i = 0; i < 14; ++i) s.theta[i] = g_rl.mu_norm(i);
+  float sm = 0.f;
+  for (int i = 0; i < 14; ++i) sm += g_rl.sigma(i);
+  s.sigma_mean = sm / 14.f;
+  snprintf(s.msg, sizeof s.msg, "%s", msg ? msg : "PPO-LITE: 14 PARAMETER");
+  gles_set_rl(s);
+}
 
 static AInputQueue* g_queue = nullptr;
 static int looper_callback(int fd, int events, void* data);
@@ -169,9 +208,21 @@ static void ui_fire_wb(int wb) {
       gles_mot_disarm();
       s.mot_clear = true;
       break;
+    case 20: gles_toggle_window(WIN_RL); break;     // RL window close
+    case 21: s.rl_train_toggle = true; break;       // TRAINIEREN / STOPP
+    case 22: s.rl_best = true; break;               // BESTE WERTE
+    case 23:                                         // RESET (2-step)
+      if (!gles_mot_confirm_armed()) {
+        gles_mot_arm_confirm();
+        gles_toast("RESET: ERNEUT DRÜCKEN", TOAST_RED);
+        return;
+      }
+      gles_mot_disarm();
+      s.rl_reset = true;
+      break;
     default: return;                                 // 8: window body
   }
-  if (wb >= 4 && wb <= 7) gles_push_ui(s);
+  if ((wb >= 4 && wb <= 7) || (wb >= 21 && wb <= 23)) gles_push_ui(s);
 }
 
 // ACTION_DOWN: begin a press (visual only). true = touch consumed by UI.
@@ -810,6 +861,15 @@ static void execution_loop() {
   g_ctrl.reset();
   g_err = ST_RUNNING;
   mot_load();  // v1.3.0: restore the motion dataset from motions.bin
+  {   // v1.6.0: restore the RL policy (mu applied to the skill params)
+    const std::string p = rl_policy_path();
+    if (!p.empty() && g_rl.load(p.c_str())) {
+      LOGI("RL policy loaded: %d episodes, best reward %.3f",
+           g_rl.stats().episodes, g_rl.stats().reward_best);
+    }
+    g_rl.apply_mean(&g_glue.skill());
+  }
+  rl_publish(nullptr);
 
   auto next = std::chrono::steady_clock::now();
   const auto period = std::chrono::microseconds(10000);  // 100 Hz
@@ -870,6 +930,40 @@ static void execution_loop() {
       mot_clear_all();
       gles_toast("MOTION-DATEN GEL\u00d6SCHT", TOAST_RED);
     }
+    if (ui.rl_train_toggle) {
+      if (!g_rl_train.load()) {
+        g_rl_train = true;
+        g_rl_ep_cycles = 0;
+        g_glue.reset_episode(g_rl_seed_base + g_rl_ep_index * 7919);
+        g_ctrl.reset();
+        gles_publish_poses(g_glue.model(), g_glue.data());
+        LOGI("RL: training started (episodes %d)", g_rl.stats().episodes);
+        gles_toast("RL-TRAINING GESTARTET", TOAST_BLUE);
+      } else {
+        g_rl_train = false;
+        const std::string p = rl_policy_path();
+        if (!p.empty()) g_rl.save(p.c_str());
+        LOGI("RL: training stopped (episodes %d)", g_rl.stats().episodes);
+        gles_toast("RL-TRAINING GESTOPPT", TOAST_ORANGE);
+      }
+      rl_publish(nullptr);
+    }
+    if (ui.rl_best) {
+      g_rl.apply_best(&g_glue.skill());
+      const std::string p = rl_policy_path();
+      if (!p.empty()) g_rl.save(p.c_str());
+      LOGI("RL: best parameters applied");
+      gles_toast("BESTE WERTE ÜBERNOMMEN", TOAST_BLUE);
+    }
+    if (ui.rl_reset) {
+      g_rl.reset();
+      g_rl.apply_mean(&g_glue.skill());
+      const std::string p = rl_policy_path();
+      if (!p.empty()) g_rl.save(p.c_str());
+      LOGI("RL: policy reset to defaults");
+      gles_toast("RL ZUR\u00dcCKGESETZT", TOAST_RED);
+    }
+    if (ui.new_episode && !g_rl_train.load()) g_new_episode = true;
 
     if (g_new_episode.exchange(false)) {
       ++episode;
@@ -881,7 +975,7 @@ static void execution_loop() {
       gles_toast("NEUE EPISODE", TOAST_BLUE);
     }
 
-    if (!g_paused.load()) {
+    if (!g_paused.load() && !g_rl_train.load()) {
       // ---- physics + perception + control (the whole pipeline) ----
       // GLES event-camera pass on THIS thread — the loop is bound to a
       // NON-window surface only (surfaceless/pbuffer), so it can never
@@ -924,6 +1018,44 @@ static void execution_loop() {
         nn.t_mlp = out.stats.t_mlp;
         gles_set_nn(nn);
       }
+    } else if (!g_paused.load()) {
+      // ---- v1.6.0 RL TRAINING MODE: 10 fast sim cycles per 10 ms tick ----
+      // No event pass, no PiP, no network stages — the arm visibly trains
+      // in the main view at ~10x realtime. Episodes end on done or cap;
+      // each completed episode triggers one PPO-lite update.
+      for (int k = 0; k < kRlCyclesPerTick && g_running; ++k) {
+        g_glue.step_cycle(g_ctrl, out, nullptr, 0, 0, false, /*fast=*/true);
+        ++g_rl_ep_cycles;
+        if (out.task.episode_done || g_rl_ep_cycles >= kRlMaxEpCycles) {
+          const int total = g_glue.total_cubes();
+          const int sorted = g_glue.sorted_count();
+          const int stacked = g_glue.stacked_count();
+          const int grasps = g_glue.ep_grasps();
+          const int fails = g_glue.ep_fails();
+          const int attempts = grasps + fails;
+          const float reward =
+              2.0f * (total ? (float)sorted / total : 0.f)
+            + 0.5f * (total ? (float)stacked / total : 0.f)
+            + 0.5f * (attempts ? (float)grasps / attempts : 0.f)
+            - 0.4f * (attempts ? (float)fails / attempts : 0.f)
+            - 0.6f * std::min(1.f, (float)g_rl_ep_cycles / (float)kRlMaxEpCycles);
+          const bool success = total > 0 && sorted == total;
+          g_rl.observe(reward, success);
+          LOGI("RL ep %d: sorted %d/%d grasps %d fails %d reward %.2f",
+               (int)g_rl.stats().episodes, sorted, total, grasps, fails, reward);
+          ++g_rl_ep_index;
+          g_glue.reset_episode(g_rl_seed_base + g_rl_ep_index * 7919);
+          g_ctrl.reset();
+          g_rl_ep_cycles = 0;
+          const std::string p = rl_policy_path();
+          if (!p.empty() && (g_rl.stats().episodes % 10) == 0)
+            g_rl.save(p.c_str());   // autosave every 10 episodes
+        }
+      }
+      gles_publish_poses(g_glue.model(), g_glue.data());
+      out_stats_set(out.stats);
+      out_task_set(out.task);
+      rl_publish(nullptr);
     }
     mot_publish();
     gles_set_diag((int)g_loop_bind, gles_gl_errs(), (long)cyc,

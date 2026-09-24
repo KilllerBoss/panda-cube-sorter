@@ -35,13 +35,13 @@ enum Phase : int {
 static const char* kPhaseName[kNumPhases] = {
   "RESET", "HOME", "HOVER", "DESCEND", "GRASP", "LIFT", "TRANSPORT", "PLACE" };
 
-// home posture — v1.5.0 CRITICAL FIX: the old pose {0.009,-0.211,0.040,
-// -1.305,-0.005,3.063,0.004} was tuned for the simplified arm. On the REAL
-// MuJoCo-Menagerie chain it folds the arm UPWARD (tcp at z = 1.08 m — beyond
-// the Panda's 0.855 m reach, IK can never leave this pose). The new home is
-// the Menagerie ready pose: tcp (0.307, 0, 0.464), hand z-axis points DOWN
-// (-0.99999), elbow above the table, joints all inside Menagerie ranges.
-constexpr float kHomeQ[kDof] = {0.00f, -0.785f, 0.00f, -2.356f, 0.00f, 1.571f, 0.785f};
+// home posture — v1.6.0 RECALIBRATED: the old pose was tuned for the
+// z-down approach assumption and actually parked the tcp at (−0.10, 0, 0.94)
+// (behind and ABOVE the scene — the IK warm start then lived outside the
+// grasp family and could never descend). The new home is the calibrated
+// approach-down posture from scene/check_kinematics.py (Q_NEUTRAL):
+// hand-x points DOWN, elbow folded, tcp above the table center.
+constexpr float kHomeQ[kDof] = {0.00f, 0.35f, 0.00f, -1.80f, 0.00f, 3.02f, 0.00f};
 // gripper TENDON-LENGTH targets (tendon = SUMME beider Finger-Slides;
 // jeder Slide in [0, 0.04], Pad-Abstand = 0.011 + 2*s).
 // Gemessen am echten Panda-Greifer (5-cm-Wuerfel):

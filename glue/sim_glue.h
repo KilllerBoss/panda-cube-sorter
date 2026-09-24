@@ -30,8 +30,11 @@ class SimGlue {
 
   // one 10 ms control cycle: mj_step x substeps, then perception+control,
   // then torque write to ctrl. `frame` = event-camera RGB input.
+  // v1.6.0: fast=true skips the perception/network stages (RL training:
+  // physics + task layer + IK only, ~10x faster than realtime).
   void step_cycle(Controller& c, ControllerOutput& out,
-                  const uint8_t* frame, int fw, int fh, bool refresh);
+                  const uint8_t* frame, int fw, int fh, bool refresh,
+                  bool fast = false);
 
   // grasp / eval state
   bool grasped() const { return grasped_; }
@@ -53,6 +56,15 @@ class SimGlue {
   // joint positions, gripper slide, tcp position) — used by the 100 Hz loop
   // to record motion clips without racing mjData
   void arm_state(float q[7], float* grip, float tcp[3]) const;
+
+  // ---------------- v1.6.0 RL skill parameters + episode counters -------
+  // skill() is the ACTIVE parameter set the skill reads every cycle (RL mu
+  // or the sampled theta of the running training episode). The trainer on
+  // the loop thread writes it between episodes — single-writer, no races.
+  SkillParams& skill() { return skill_; }
+  const SkillParams& skill() const { return skill_; }
+  int ep_grasps() const { return ep_grasps_; }   // PH_GRASP -> PH_LIFT events
+  int ep_fails() const { return ep_fails_; }     // grasp fails + drops
 
  private:
   void resolve_ids();
@@ -111,6 +123,10 @@ class SimGlue {
   int   assist_cube_ = -1;
   float assist_rel_[3] = {0};     // cube offset in hand frame at grasp time
   float assist_q_[4] = {1, 0, 0, 0};  // hand quat at grasp time
+  // v1.6.0: RL skill parameters + per-episode grasp counters
+  SkillParams skill_ = {};
+  int ep_grasps_ = 0, ep_fails_ = 0;
+  int ep_prev_phase_ = PH_RESET;
 };
 
 }  // namespace pcs

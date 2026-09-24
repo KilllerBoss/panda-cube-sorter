@@ -13,6 +13,7 @@ set(MUJOCO_DIR "" CACHE PATH "MuJoCo install dir (e.g. the pip wheel package dir
 
 add_executable(pcs_harness
   src/harness_main.cpp
+  ../native/src/rl_policy.cpp
   ../native/src/event_camera.cpp
   ../native/src/alif_lsnn.cpp
   ../native/src/pred_coder.cpp

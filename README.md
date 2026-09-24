@@ -11,6 +11,47 @@ Farben zu sortieren und in Zonen zu stapeln — **ohne Internet, ohne Cloud, mit
 
 ---
 
+## Neu in v1.6.0 — RL-Finetuning auf dem Gerät („kann man weiter trainieren mit RL?")
+
+**Ja — jetzt echt.** Die neue Taste **RL** öffnet das RL-Trainingsfenster:
+
+* **PPO-lite (episodisch, geclipptes Surrogat)** lernt auf einem 14-dimensionalen
+  Griff-Skill-Vektor: Anfahrtshöhe, Greiftiefe, Vor-Schließ-Spalt, Phasenzeiten,
+  Tore, Ziel-Glättung, Tempodeckel, PD-Verstärkung, Tragefeder, Abgabezeitpunkt.
+  Pro Trainings-Episode wird ein θ ~ N(μ, σ²) gezogen, die Episode läuft im
+  MuJoCo-Simulator (Fast-Mode: nur Physik + Task + IK, ~10x Echtzeit), und der
+  Reward (Sortierquote + Greifquote − Fehlquote − Zeit) treibt den Update.
+* **TRAINIEREN** startet/stoppt das Training (sichtbar im Hauptbildschirm —
+  der Roboter beschleunigt sichtbar durch Episoden), **BESTE WERTE** übernimmt
+  den bisher besten Parametersatz, **ZURÜCKSETZEN** stellt die Kalibrierung
+  zurück. Alles persistiert in `rl_policy.bin` (Auto-Save alle 10 Episoden).
+* Das RL-Fenster zeigt live: Episoden, Erfolgsquote gesamt/letzte 20, Reward,
+  aktuellen Episoden-Fortschritt und die gelernten Parameter als Balken.
+* Desktop-Validierung: `pcs_harness --mode train --episodes N` lernt mit
+  exakt demselben Code (`native/src/rl_policy.cpp`) wie die APK.
+
+**Struktur-Fixes in v1.6.0** (0%-Grund der Grifffamilie):
+1. **Anfahrtsachse korrigiert** — der Menagerie-Greifer arbeitet entlang
+   hand-lokal +x; die IK hatte noch hand-z nach unten geführt (alter
+   planarer Arm) → der Arm fuhr Handfläche-voran auf den Tisch.
+2. **Home-Pose rekaliert** auf die Approach-down-Familie aus
+   `scene/check_kinematics.py` (Q_NEUTRAL).
+3. **Zweistufige Annäherung** (Transithöhe → vertikales Absenken) +
+   HOVER/DESCEND verlassen ihre Phase erst beim *Erreichen* des Ziels —
+   der Ellbogen pflügt nicht mehr durchs Würfelfeld.
+4. **Greif-Phase hält die Höhe** bei einseitigem Kontakt (kein
+   Wegschieben der Würfel mehr durch hängende Greiferkante).
+5. IK: Nullraum-Haltungs-Bias, relative Klemm-Schwellen (RL-invariant),
+   bestem-Iterate-Logik für ferne Ziele.
+
+**Ehrlicher Stand:** Die Kopfloses-Benchmark-Erfolgsquote ist aktuell noch
+nicht auf 100 % — die Greiftiefen-Kalibrierung innerhalb der
+Approach-down-Familie ist das nächste Arbeitsthema; genau dafür ist das
+RL-Werkzeug jetzt da: Auf dem Gerät TRAINIEREN drücken, Erfolgsquote im
+RL-Fenster beobachten, BESTE WERTE übernehmen.
+
+---
+
 ## Was ist in dieser Version?
 
 | Baustein | Status | Ort |

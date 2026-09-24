@@ -6,6 +6,7 @@
 // damped-LS IK inside the glue layer.
 #pragma once
 #include "pcs/types.h"
+#include "pcs/rl_policy.h"
 
 namespace pcs {
 
@@ -27,6 +28,9 @@ struct TaskInput {
   float q_goal_ik[kDof];   // glue IK solution (previous cycle)
   CubeSlot cubes[kNumCubes];
   int   n_cubes;
+  // v1.6.0: learned skill parameters (RL policy mean / sampled theta).
+  // null = v1.5.0 hand-tuned defaults (safe for all legacy callers).
+  const SkillParams* skill = nullptr;
 };
 
 struct TaskOutput {

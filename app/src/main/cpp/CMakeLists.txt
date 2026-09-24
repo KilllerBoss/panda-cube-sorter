@@ -22,6 +22,7 @@ add_library(panda_sorter SHARED
     native_main.cpp
     gles_renderer.cpp
     ui_font.cpp
+    ../../../../native/src/rl_policy.cpp
     ../../../../native/src/event_camera.cpp
     ../../../../native/src/alif_lsnn.cpp
     ../../../../native/src/pred_coder.cpp
