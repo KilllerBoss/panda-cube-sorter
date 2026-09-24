@@ -7,7 +7,7 @@ Farben zu sortieren und in Zonen zu stapeln — **ohne Internet, ohne Cloud, mit
 100-Hz-Taktung und kontinuierlicher Online-Adaption**.
 
 **Repo:** https://github.com/KilllerBoss/panda-cube-sorter
-**APK-Download:** [Release v1.5.0](https://github.com/KilllerBoss/panda-cube-sorter/releases/download/v1.5.0/PandaCubeSorter-v1.5.0-release.apk)
+**APK-Download:** [Release v1.6.0](https://github.com/KilllerBoss/panda-cube-sorter/releases/download/v1.6.0/PandaCubeSorter-v1.6.0-release.apk)
 
 ---
 
